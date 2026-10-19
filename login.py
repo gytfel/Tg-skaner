@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 
 from telethon import TelegramClient
+from telethon.errors import ApiIdInvalidError
 from telethon.utils import get_display_name
 
 from config import load_config
@@ -22,7 +23,17 @@ async def main() -> None:
     cfg = load_config()
 
     user = TelegramClient(cfg.session_name, cfg.api_id, cfg.api_hash)
-    await user.start()  # интерактивно: номер -> код -> (2FA-пароль)
+    try:
+        await user.start()  # интерактивно: номер -> код -> (2FA-пароль)
+    except ApiIdInvalidError:
+        print(
+            "\n❌ Неверная пара API_ID / API_HASH.\n"
+            "   Откройте env/.env и проверьте значения — возьмите их на\n"
+            "   https://my.telegram.org -> API development tools (api_id — число,\n"
+            "   api_hash — строка из 32 символов). Ничего не перепутайте местами."
+        )
+        await user.disconnect()
+        raise SystemExit(1)
     me = await user.get_me()
     print(f"✅ Вход выполнен: {get_display_name(me)} (id {me.id})")
     await user.disconnect()
