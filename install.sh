@@ -3,10 +3,11 @@
 # Tg-skaner — установка на VPS (Debian/Ubuntu) с автозапуском через systemd.
 #
 # Использование (на свежем сервере):
-#   sudo apt update && sudo apt install -y git
-#   git clone <URL-репозитория> tg-skaner
-#   cd tg-skaner
-#   sudo bash install.sh
+#   apt update && apt install -y git
+#   git clone -b claude/telegram-deleted-messages-bot-ovwzus --single-branch \
+#     https://github.com/gytfel/Tg-skaner.git
+#   cd Tg-skaner
+#   bash install.sh      # не под root — добавьте sudo
 #
 set -euo pipefail
 

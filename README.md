@@ -47,11 +47,15 @@ Telegram-бота**. Захват работает на вашем аккаун�
 На свежем сервере (Ubuntu/Debian), подключившись по SSH:
 
 ```bash
-sudo apt update && sudo apt install -y git
-git clone <URL-этого-репозитория> tg-skaner
-cd tg-skaner
-sudo bash install.sh
+apt update && apt install -y git
+git clone -b claude/telegram-deleted-messages-bot-ovwzus --single-branch \
+  https://github.com/gytfel/Tg-skaner.git
+cd Tg-skaner
+bash install.sh          # не под root — добавьте sudo: sudo bash install.sh
 ```
+
+> После слияния ветки в `main` клонировать можно обычным
+> `git clone https://github.com/gytfel/Tg-skaner.git` без `-b ...`.
 
 Скрипт спросит `API_ID`, `API_HASH`, `BOT_TOKEN`, затем номер телефона и код из
 Telegram (и 2FA-пароль, если включён). После установки:
@@ -72,10 +76,11 @@ systemctl stop tg-skaner        # остановка
 Нужен Python 3.10+.
 
 ```bash
-git clone <URL-этого-репозитория>
-cd tg-skaner
+git clone -b claude/telegram-deleted-messages-bot-ovwzus --single-branch \
+  https://github.com/gytfel/Tg-skaner.git
+cd Tg-skaner
 
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
