@@ -1,12 +1,19 @@
-"""Загрузка конфигурации из переменных окружения (.env)."""
+"""Загрузка конфигурации из переменных окружения (env/.env)."""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Файл настроек лежит в отдельной папке env/ рядом с кодом.
+_ROOT = Path(__file__).resolve().parent
+_ENV_FILE = _ROOT / "env" / ".env"
+if _ENV_FILE.exists():
+    load_dotenv(_ENV_FILE)
+else:
+    load_dotenv()  # запасной вариант: .env в текущем каталоге
 
 
 def _as_bool(value: str | None, default: bool) -> bool:

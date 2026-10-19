@@ -1,5 +1,7 @@
 # Секреты и сессии Telegram — НИКОГДА не коммитить
+# (env/.env игнорируется, а env/.env.example — отслеживается как шаблон)
 .env
+env/.env
 *.session
 *.session-journal
 
@@ -13,7 +15,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
-env/
 .mypy_cache/
 .pytest_cache/
 

@@ -54,16 +54,18 @@ run_as_user "$PYTHON" -m venv "$VENV"
 run_as_user "$VENV/bin/pip" install --quiet --upgrade pip setuptools wheel
 run_as_user "$VENV/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
 
-# 5. Файл настроек .env.
-if [ ! -f "$APP_DIR/.env" ]; then
-  say "Настройка .env"
+# 5. Файл настроек env/.env.
+ENV_FILE="$APP_DIR/env/.env"
+if [ ! -f "$ENV_FILE" ]; then
+  say "Настройка env/.env"
   echo "   API_ID и API_HASH — с https://my.telegram.org (API development tools)"
   echo "   BOT_TOKEN — у @BotFather командой /newbot"
   read -rp "   API_ID: " API_ID
   read -rsp "   API_HASH: " API_HASH; echo
   read -rsp "   BOT_TOKEN: " BOT_TOKEN; echo
+  mkdir -p "$APP_DIR/env"
   umask 077
-  cat > "$APP_DIR/.env" <<EOF
+  cat > "$ENV_FILE" <<EOF
 API_ID=$API_ID
 API_HASH=$API_HASH
 BOT_TOKEN=$BOT_TOKEN
@@ -72,14 +74,15 @@ SAVE_MEDIA=true
 RETENTION_DAYS=7
 IGNORE_OUTGOING=false
 EOF
-  chown "$RUN_USER":"$RUN_USER" "$APP_DIR/.env"
-  chmod 600 "$APP_DIR/.env"
+  chown "$RUN_USER":"$RUN_USER" "$APP_DIR/env" "$ENV_FILE"
+  chmod 700 "$APP_DIR/env"
+  chmod 600 "$ENV_FILE"
 else
-  say ".env уже существует — пропускаю."
+  say "env/.env уже существует — пропускаю."
 fi
 
-# Имя сессии из .env (на случай, если .env заполняли вручную).
-SESSION_NAME="$(sed -n 's/^SESSION_NAME=//p' "$APP_DIR/.env" | head -n1)"
+# Имя сессии из env/.env (на случай, если файл заполняли вручную).
+SESSION_NAME="$(sed -n 's/^SESSION_NAME=//p' "$ENV_FILE" | head -n1)"
 SESSION_NAME="${SESSION_NAME:-tg_skaner}"
 
 # 6. Одноразовый интерактивный вход (создаёт нужный *.session).
@@ -125,6 +128,6 @@ echo "   Стоп:    systemctl stop $APP_NAME"
 echo
 
 # Подсказка про Start — только если доставка идёт через бота.
-if grep -Eq '^BOT_TOKEN=.+' "$APP_DIR/.env"; then
+if grep -Eq '^BOT_TOKEN=.+' "$ENV_FILE"; then
   echo "Откройте вашего бота в Telegram и нажмите Start, чтобы получать отчёты."
 fi

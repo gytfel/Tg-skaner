@@ -79,7 +79,7 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-cp .env.example .env               # впишите API_ID, API_HASH, BOT_TOKEN
+cp env/.env.example env/.env       # впишите API_ID, API_HASH, BOT_TOKEN
 python login.py                    # одноразовый вход (создаст *.session)
 python bot.py                      # запуск; держите процесс живым
 ```
@@ -87,7 +87,7 @@ python bot.py                      # запуск; держите процесс
 Чтобы процесс не умирал при закрытии SSH — используйте `tmux`/`screen` или
 вариант с systemd выше.
 
-## Параметры `.env`
+## Параметры `env/.env`
 
 | Переменная        | По умолчанию | Описание                                                            |
 |-------------------|--------------|---------------------------------------------------------------------|
@@ -107,15 +107,17 @@ python bot.py                      # запуск; держите процесс
 |----------------------|---------------------------------------------------|
 | `bot.py`             | Точка входа: захват (user) + доставка (bot)        |
 | `login.py`           | Одноразовый интерактивный вход, создаёт `*.session`|
-| `config.py`          | Чтение настроек из `.env`                           |
+| `config.py`          | Чтение настроек из `env/.env`                       |
 | `db.py`              | Кэш сообщений на SQLite                             |
 | `install.sh`         | Установка на VPS + systemd-автозапуск              |
+| `env/.env.example`   | Шаблон настроек (копируется в `env/.env`)           |
+| `env/.env`           | Ваши настройки (секрет — создаётся вами, не в git)  |
 | `messages.db`        | Локальная база (создаётся автоматически)            |
 | `media/`             | Скачанные вложения (создаётся автоматически)        |
 | `*.session`          | Файлы сессий Telegram (секрет — не публиковать!)    |
 
-`.env`, `*.session`, `messages.db` и `media/` добавлены в `.gitignore` —
-не коммитьте их.
+`env/.env`, `*.session`, `messages.db` и `media/` добавлены в `.gitignore` —
+не коммитьте их (а `env/.env.example` — шаблон, его коммитить можно).
 
 ## А как же Telegram Business?
 
