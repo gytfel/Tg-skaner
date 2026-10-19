@@ -18,6 +18,7 @@ import asyncio
 import html
 import logging
 import os
+import sys
 import time
 from datetime import datetime
 
@@ -34,6 +35,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-skaner")
 
+# Код выхода, который говорит systemd НЕ перезапускать сервис (нет сессии).
+EXIT_NO_SESSION = 69
+
 cfg = load_config()
 store = MessageStore("messages.db")
 
@@ -49,7 +53,7 @@ bot = (
     else None
 )
 
-# Куда и чем слать отчёты — заполняется в main() после входа.
+# Куда и чем слать отчёты — заполняется в main() до регистрации хендлеров.
 _notify_client: TelegramClient | None = None
 _notify_to = None
 
@@ -78,6 +82,7 @@ def _header(row, emoji: str, label: str) -> str:
 
 
 async def _send(text: str, media_path: str | None = None) -> None:
+    """Доставка отчёта. Best-effort: ошибку логируем, но не роняем процесс."""
     if _notify_client is None or _notify_to is None:
         return
     try:
@@ -96,7 +101,6 @@ async def _send(text: str, media_path: str | None = None) -> None:
 
 # ─────────────────────────── хендлеры (user) ────────────────────────────────
 
-@user.on(events.NewMessage)
 async def cache_new(event: events.NewMessage.Event) -> None:
     """Сохраняем каждое проходящее сообщение в кэш."""
     msg = event.message
@@ -109,14 +113,8 @@ async def cache_new(event: events.NewMessage.Event) -> None:
     except Exception:  # noqa: BLE001
         sender = chat = None
 
-    media_path: str | None = None
-    if cfg.save_media and msg.media:
-        try:
-            prefix = os.path.join(MEDIA_DIR, f"{event.chat_id}_{msg.id}")
-            media_path = await msg.download_media(file=prefix)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Не удалось скачать медиа: %s", exc)
-
+    # Сначала фиксируем текст и метаданные — они не должны зависеть от того,
+    # успеет ли докачаться медиа до возможного удаления.
     store.add(
         chat_id=event.chat_id,
         message_id=msg.id,
@@ -126,13 +124,22 @@ async def cache_new(event: events.NewMessage.Event) -> None:
         sender_username=getattr(sender, "username", None),
         chat_title=get_display_name(chat) if chat else None,
         text=msg.message or "",
-        media_path=media_path,
+        media_path=None,
         outgoing=1 if msg.out else 0,
         date=int(msg.date.timestamp()) if msg.date else None,
     )
 
+    # Медиа качаем уже после сохранения строки; путь дописываем по готовности.
+    if cfg.save_media and msg.media:
+        try:
+            prefix = os.path.join(MEDIA_DIR, f"{event.chat_id}_{msg.id}")
+            path = await msg.download_media(file=prefix)
+            if path:
+                store.update_media(event.chat_id, msg.id, path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось скачать медиа: %s", exc)
 
-@user.on(events.MessageEdited)
+
 async def on_edited(event: events.MessageEdited.Event) -> None:
     """Фиксируем правки: показываем «было / стало» и обновляем кэш."""
     msg = event.message
@@ -154,7 +161,6 @@ async def on_edited(event: events.MessageEdited.Event) -> None:
     store.update_text(event.chat_id, msg.id, new_text)
 
 
-@user.on(events.MessageDeleted)
 async def on_deleted(event: events.MessageDeleted.Event) -> None:
     """Главное: сообщение удалили — достаём оригинал из кэша и пересылаем."""
     for mid in event.deleted_ids:
@@ -179,14 +185,11 @@ async def on_deleted(event: events.MessageDeleted.Event) -> None:
 
 # ─────────────────────────── хендлеры (bot) ─────────────────────────────────
 
-if bot is not None:
-
-    @bot.on(events.NewMessage(pattern=r"^/start"))
-    async def on_start(event: events.NewMessage.Event) -> None:
-        await event.respond(
-            "✅ Tg-skaner на связи. Сюда будут приходить удалённые и "
-            "изменённые сообщения из ваших чатов."
-        )
+async def on_start(event: events.NewMessage.Event) -> None:
+    await event.respond(
+        "✅ Tg-skaner на связи. Сюда будут приходить удалённые и "
+        "изменённые сообщения из ваших чатов."
+    )
 
 
 # ─────────────────────────── фоновая очистка ────────────────────────────────
@@ -208,10 +211,26 @@ async def retention_loop() -> None:
 
 # ───────────────────────────────── запуск ───────────────────────────────────
 
+async def _start_user() -> None:
+    """Подключаем user-клиент. Без валидной сессии: в терминале — интерактивный
+    вход, под systemd (нет TTY) — внятная ошибка и выход без краш-цикла."""
+    await user.connect()
+    if not await user.is_user_authorized():
+        if sys.stdin and sys.stdin.isatty():
+            await user.start()  # интерактивный вход в реальном терминале
+        else:
+            log.error(
+                "Нет валидной сессии %s.session. Выполните один раз: python login.py",
+                cfg.session_name,
+            )
+            await user.disconnect()
+            raise SystemExit(EXIT_NO_SESSION)
+
+
 async def main() -> None:
     global _notify_client, _notify_to
 
-    await user.start()  # при первом запуске спросит номер, код и (если есть) 2FA
+    await _start_user()
     me = await user.get_me()
     log.info("Вход как пользователь: %s (id %s)", get_display_name(me), me.id)
 
@@ -224,22 +243,49 @@ async def main() -> None:
         _notify_to = cfg.owner_id or me.id
         coros.append(bot.run_until_disconnected())
         log.info("Доставка через бота @%s -> id %s", bot_me.username, _notify_to)
+        # Стартовое сообщение — громко, чтобы недоступность бота была видна.
+        try:
+            await bot.send_message(
+                _notify_to,
+                "✅ <b>Tg-skaner запущен.</b>\n"
+                "Отслеживаю удаления и правки сообщений в ваших чатах.",
+                parse_mode="html",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "Бот @%s не может написать id %s. Откройте бота в Telegram, "
+                "нажмите Start и перезапустите сервис. Детали: %s",
+                bot_me.username,
+                _notify_to,
+                exc,
+            )
     else:
         _notify_client = user
         _notify_to = resolve_log_chat(cfg.log_chat)
         log.info("Доставка в LOG_CHAT: %s", cfg.log_chat)
-
-    try:
         await _send(
             "✅ <b>Tg-skaner запущен.</b>\n"
             "Отслеживаю удаления и правки сообщений в ваших чатах."
         )
-    except Exception:  # noqa: BLE001
-        pass  # уже залогировано в _send; продолжаем слушать события
+
+    # Хендлеры регистрируем только когда цель доставки уже готова —
+    # иначе событие в момент старта ушло бы «в никуда».
+    user.add_event_handler(cache_new, events.NewMessage())
+    user.add_event_handler(on_edited, events.MessageEdited())
+    user.add_event_handler(on_deleted, events.MessageDeleted())
+    if bot is not None:
+        bot.add_event_handler(on_start, events.NewMessage(pattern=r"^/start"))
 
     asyncio.create_task(retention_loop())
     log.info("Слушаю события. Ctrl+C для остановки.")
-    await asyncio.gather(*coros)
+
+    # Если любой из клиентов отвалится — выходим с ненулевым кодом, чтобы
+    # systemd перезапустил полностью рабочую пару, а не «половину».
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

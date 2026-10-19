@@ -74,6 +74,14 @@ class MessageStore:
         )
         self.conn.commit()
 
+    def update_media(self, chat_id: int, message_id: int, path: str) -> None:
+        """Дописывает путь к медиа после того, как оно скачалось (см. bot.py)."""
+        self.conn.execute(
+            "UPDATE messages SET media_path = ? WHERE chat_id = ? AND message_id = ?",
+            (path, chat_id, message_id),
+        )
+        self.conn.commit()
+
     def cleanup(self, older_than_ts: int) -> list[str]:
         """Удаляет старые записи. Возвращает пути к медиа, которые пора стереть с диска."""
         cur = self.conn.execute(

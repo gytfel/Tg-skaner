@@ -94,7 +94,7 @@ python bot.py                      # запуск; держите процесс
 | `API_ID`          | —            | ID приложения с my.telegram.org                                     |
 | `API_HASH`        | —            | Hash приложения с my.telegram.org                                   |
 | `BOT_TOKEN`       | —            | Токен бота от @BotFather. Задан → отчёты шлются в бота               |
-| `OWNER_ID`        | авто         | Кому слать (числовой id). По умолчанию — вашему же аккаунту          |
+| `OWNER_ID`        | авто         | Кому слать (числовой id); учитывается только при заданном `BOT_TOKEN`. По умолчанию — ваш аккаунт |
 | `SESSION_NAME`    | `tg_skaner`  | Имя файла сессии Telethon                                           |
 | `LOG_CHAT`        | `me`         | Куда слать, если `BOT_TOKEN` пуст: `me`, `@username` или id          |
 | `SAVE_MEDIA`      | `true`       | Сохранять медиа, чтобы восстановить после удаления                  |
