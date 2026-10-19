@@ -1,0 +1,23 @@
+# Секреты и сессии Telegram — НИКОГДА не коммитить
+.env
+*.session
+*.session-journal
+
+# Локальная база сообщений и скачанные медиа
+*.db
+*.db-journal
+media/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+
+# IDE / ОС
+.vscode/
+.idea/
+.DS_Store
