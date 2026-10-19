@@ -20,6 +20,8 @@ class Config:
     api_id: int
     api_hash: str
     session_name: str
+    bot_token: str | None
+    owner_id: int | None
     log_chat: str
     save_media: bool
     retention_days: int
@@ -41,10 +43,18 @@ def load_config() -> Config:
     except ValueError as exc:  # noqa: PERF203
         raise SystemExit("API_ID должен быть числом.") from exc
 
+    owner_id_raw = os.getenv("OWNER_ID", "").strip()
+    try:
+        owner_id = int(owner_id_raw) if owner_id_raw else None
+    except ValueError as exc:
+        raise SystemExit("OWNER_ID должен быть числом (или пустым).") from exc
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash.strip(),
         session_name=os.getenv("SESSION_NAME", "tg_skaner").strip(),
+        bot_token=(os.getenv("BOT_TOKEN", "").strip() or None),
+        owner_id=owner_id,
         log_chat=os.getenv("LOG_CHAT", "me").strip(),
         save_media=_as_bool(os.getenv("SAVE_MEDIA"), True),
         retention_days=int(os.getenv("RETENTION_DAYS", "7")),

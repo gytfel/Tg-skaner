@@ -1,11 +1,14 @@
 """Tg-skaner — userbot-архиватор удалённых и изменённых сообщений.
 
-Работает на вашем собственном аккаунте через api_id/api_hash (Telethon).
+Захват сообщений работает на вашем аккаунте через api_id/api_hash (Telethon).
+Доставка отчётов — через отдельного Telegram-бота (токен от @BotFather):
+удаления и правки прилетают вам в личку с ботом, а не в «Избранное».
+Если BOT_TOKEN не задан — откат к доставке в LOG_CHAT (по умолчанию «Избранное»).
+
 Логика:
-  1. Каждое входящее/исходящее сообщение сохраняется в локальный кэш (SQLite).
-  2. Когда Telegram сообщает об удалении — оригинал достаётся из кэша и
-     пересылается в LOG_CHAT (по умолчанию — ваше «Избранное»).
-  3. Правки сообщений фиксируются с показом «было / стало».
+  1. Каждое входящее/исходящее сообщение кэшируется локально (SQLite).
+  2. При удалении Telegram присылает только id — оригинал достаётся из кэша.
+  3. Правки фиксируются как «было / стало».
 
 Только для вашего аккаунта и ваших переписок.
 """
@@ -37,8 +40,18 @@ store = MessageStore("messages.db")
 MEDIA_DIR = "media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
-client = TelegramClient(cfg.session_name, cfg.api_id, cfg.api_hash)
-LOG_TARGET = resolve_log_chat(cfg.log_chat)
+# Клиент-пользователь: ловит сообщения в ваших чатах.
+user = TelegramClient(cfg.session_name, cfg.api_id, cfg.api_hash)
+# Клиент-бот: доставляет отчёты вам в личку (если задан BOT_TOKEN).
+bot = (
+    TelegramClient(cfg.session_name + "_bot", cfg.api_id, cfg.api_hash)
+    if cfg.bot_token
+    else None
+)
+
+# Куда и чем слать отчёты — заполняется в main() после входа.
+_notify_client: TelegramClient | None = None
+_notify_to = None
 
 
 # ─────────────────────────── вспомогательное ────────────────────────────────
@@ -65,17 +78,25 @@ def _header(row, emoji: str, label: str) -> str:
 
 
 async def _send(text: str, media_path: str | None = None) -> None:
+    if _notify_client is None or _notify_to is None:
+        return
     try:
-        await client.send_message(LOG_TARGET, text, parse_mode="html", link_preview=False)
+        await _notify_client.send_message(
+            _notify_to, text, parse_mode="html", link_preview=False
+        )
         if media_path and os.path.exists(media_path):
-            await client.send_file(LOG_TARGET, media_path)
+            await _notify_client.send_file(_notify_to, media_path)
     except Exception as exc:  # noqa: BLE001
-        log.warning("Не удалось отправить отчёт в LOG_CHAT: %s", exc)
+        log.warning(
+            "Не удалось доставить отчёт. Если используете бота — откройте его в "
+            "Telegram и нажмите Start. Детали: %s",
+            exc,
+        )
 
 
-# ─────────────────────────────── хендлеры ───────────────────────────────────
+# ─────────────────────────── хендлеры (user) ────────────────────────────────
 
-@client.on(events.NewMessage)
+@user.on(events.NewMessage)
 async def cache_new(event: events.NewMessage.Event) -> None:
     """Сохраняем каждое проходящее сообщение в кэш."""
     msg = event.message
@@ -111,7 +132,7 @@ async def cache_new(event: events.NewMessage.Event) -> None:
     )
 
 
-@client.on(events.MessageEdited)
+@user.on(events.MessageEdited)
 async def on_edited(event: events.MessageEdited.Event) -> None:
     """Фиксируем правки: показываем «было / стало» и обновляем кэш."""
     msg = event.message
@@ -133,7 +154,7 @@ async def on_edited(event: events.MessageEdited.Event) -> None:
     store.update_text(event.chat_id, msg.id, new_text)
 
 
-@client.on(events.MessageDeleted)
+@user.on(events.MessageDeleted)
 async def on_deleted(event: events.MessageDeleted.Event) -> None:
     """Главное: сообщение удалили — достаём оригинал из кэша и пересылаем."""
     for mid in event.deleted_ids:
@@ -156,6 +177,18 @@ async def on_deleted(event: events.MessageDeleted.Event) -> None:
         log.info("Зафиксировано удаление: chat=%s msg=%s", row["chat_id"], mid)
 
 
+# ─────────────────────────── хендлеры (bot) ─────────────────────────────────
+
+if bot is not None:
+
+    @bot.on(events.NewMessage(pattern=r"^/start"))
+    async def on_start(event: events.NewMessage.Event) -> None:
+        await event.respond(
+            "✅ Tg-skaner на связи. Сюда будут приходить удалённые и "
+            "изменённые сообщения из ваших чатов."
+        )
+
+
 # ─────────────────────────── фоновая очистка ────────────────────────────────
 
 async def retention_loop() -> None:
@@ -176,16 +209,37 @@ async def retention_loop() -> None:
 # ───────────────────────────────── запуск ───────────────────────────────────
 
 async def main() -> None:
-    await client.start()  # при первом запуске спросит номер, код и (если есть) 2FA-пароль
-    me = await client.get_me()
-    log.info("Вход выполнен: %s (id %s)", get_display_name(me), me.id)
-    await _send(
-        "✅ <b>Tg-skaner запущен.</b>\n"
-        "Отслеживаю удаления и правки сообщений в ваших чатах."
-    )
+    global _notify_client, _notify_to
+
+    await user.start()  # при первом запуске спросит номер, код и (если есть) 2FA
+    me = await user.get_me()
+    log.info("Вход как пользователь: %s (id %s)", get_display_name(me), me.id)
+
+    coros = [user.run_until_disconnected()]
+
+    if bot is not None:
+        await bot.start(bot_token=cfg.bot_token)
+        bot_me = await bot.get_me()
+        _notify_client = bot
+        _notify_to = cfg.owner_id or me.id
+        coros.append(bot.run_until_disconnected())
+        log.info("Доставка через бота @%s -> id %s", bot_me.username, _notify_to)
+    else:
+        _notify_client = user
+        _notify_to = resolve_log_chat(cfg.log_chat)
+        log.info("Доставка в LOG_CHAT: %s", cfg.log_chat)
+
+    try:
+        await _send(
+            "✅ <b>Tg-skaner запущен.</b>\n"
+            "Отслеживаю удаления и правки сообщений в ваших чатах."
+        )
+    except Exception:  # noqa: BLE001
+        pass  # уже залогировано в _send; продолжаем слушать события
+
     asyncio.create_task(retention_loop())
     log.info("Слушаю события. Ctrl+C для остановки.")
-    await client.run_until_disconnected()
+    await asyncio.gather(*coros)
 
 
 if __name__ == "__main__":
