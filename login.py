@@ -23,19 +23,25 @@ async def main() -> None:
     cfg = load_config()
 
     user = TelegramClient(cfg.session_name, cfg.api_id, cfg.api_hash)
-    try:
-        await user.start()  # интерактивно: номер -> код -> (2FA-пароль)
-    except ApiIdInvalidError:
-        print(
-            "\n❌ Неверная пара API_ID / API_HASH.\n"
-            "   Откройте env/.env и проверьте значения — возьмите их на\n"
-            "   https://my.telegram.org -> API development tools (api_id — число,\n"
-            "   api_hash — строка из 32 символов). Ничего не перепутайте местами."
-        )
-        await user.disconnect()
-        raise SystemExit(1)
-    me = await user.get_me()
-    print(f"✅ Вход выполнен: {get_display_name(me)} (id {me.id})")
+    await user.connect()
+    if await user.is_user_authorized():
+        # Сессия уже рабочая — ничего вводить не нужно (идемпотентно).
+        me = await user.get_me()
+        print(f"✅ Вход уже выполнен: {get_display_name(me)} (id {me.id})")
+    else:
+        try:
+            await user.start()  # интерактивно: номер -> код -> (2FA-пароль)
+        except ApiIdInvalidError:
+            print(
+                "\n❌ Неверная пара API_ID / API_HASH.\n"
+                "   Откройте env/.env и проверьте значения — возьмите их на\n"
+                "   https://my.telegram.org -> API development tools (api_id — число,\n"
+                "   api_hash — строка из 32 символов). Ничего не перепутайте местами."
+            )
+            await user.disconnect()
+            raise SystemExit(1)
+        me = await user.get_me()
+        print(f"✅ Вход выполнен: {get_display_name(me)} (id {me.id})")
     await user.disconnect()
 
     if cfg.bot_token:

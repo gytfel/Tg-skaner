@@ -82,17 +82,10 @@ else
   say "env/.env уже существует — пропускаю."
 fi
 
-# Имя сессии из env/.env (на случай, если файл заполняли вручную).
-SESSION_NAME="$(sed -n 's/^SESSION_NAME=//p' "$ENV_FILE" | head -n1)"
-SESSION_NAME="${SESSION_NAME:-tg_skaner}"
-
-# 6. Одноразовый интерактивный вход (создаёт нужный *.session).
-if [ ! -f "$APP_DIR/${SESSION_NAME}.session" ]; then
-  say "Первый вход в Telegram — введите номер телефона, код и (если есть) 2FA-пароль:"
-  run_as_user bash -c "cd '$APP_DIR' && '$VENV/bin/python' login.py"
-else
-  say "Файл сессии ${SESSION_NAME}.session уже есть — вход пропускаю."
-fi
+# 6. Вход в Telegram. login.py сам пропустит шаг, если сессия уже авторизована,
+# и выполнит интерактивный вход, если нет (в т.ч. при пустом/битом .session).
+say "Проверяю вход в Telegram (если нужно — введите номер, код и 2FA-пароль):"
+run_as_user bash -c "cd '$APP_DIR' && '$VENV/bin/python' login.py"
 
 # 7. systemd-сервис.
 say "Создаю и запускаю systemd-сервис '$APP_NAME'..."
