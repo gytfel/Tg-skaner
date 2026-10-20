@@ -43,14 +43,15 @@ cfg = load_config()
 store = MessageStore("messages.db")
 
 MEDIA_DIR = "media"
+MEDIA_TMP = "media_tmp"  # сюда качаем, и только готовый файл переносим в media/
 os.makedirs(MEDIA_DIR, exist_ok=True)
+os.makedirs(MEDIA_TMP, exist_ok=True)
 
 EXPORT_DIR = "export"
 # Единый архив всех копий + автоэкспорт по лимиту (если включён).
 archiver = (
     Archiver(EXPORT_DIR, MEDIA_DIR, cfg.export_limit_mb) if cfg.export_enabled else None
 )
-_export_lock = asyncio.Lock()
 
 # Клиент-пользователь: ловит сообщения в ваших чатах.
 user = TelegramClient(cfg.session_name, cfg.api_id, cfg.api_hash)
@@ -138,14 +139,18 @@ async def cache_new(event: events.NewMessage.Event) -> None:
     )
 
     # Медиа качаем уже после сохранения строки; путь дописываем по готовности.
+    # Качаем во временную папку и переносим в media/ атомарно — чтобы экспорт
+    # никогда не увидел и не удалил недокачанный файл.
     media_path: str | None = None
     if cfg.save_media and msg.media:
         try:
-            prefix = os.path.join(MEDIA_DIR, f"{event.chat_id}_{msg.id}")
-            path = await msg.download_media(file=prefix)
-            if path:
-                store.update_media(event.chat_id, msg.id, path)
-                media_path = path
+            tmp_prefix = os.path.join(MEDIA_TMP, f"{event.chat_id}_{msg.id}")
+            tmp_path = await msg.download_media(file=tmp_prefix)
+            if tmp_path:
+                final_path = os.path.join(MEDIA_DIR, os.path.basename(tmp_path))
+                os.replace(tmp_path, final_path)  # атомарно (та же ФС)
+                store.update_media(event.chat_id, msg.id, final_path)
+                media_path = final_path
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось скачать медиа: %s", exc)
 
@@ -243,43 +248,56 @@ async def retention_loop() -> None:
 
 async def export_loop() -> None:
     """Следит за объёмом архива; при превышении лимита пакует всё в zip,
-    отправляет владельцу через бота и чистит локальные копии."""
+    отправляет владельцу через бота и чистит локальные копии.
+
+    При сбое отправки НЕ пересобирает zip каждый цикл (иначе шторм упаковки и
+    рост .part при оффлайне), а держит готовый zip и повторяет отправку того же
+    файла с экспоненциальной паузой.
+    """
     if archiver is None:
         return
+    pending = None   # (zip_path, part_files, media_files) — собранный, но не отправленный
+    backoff = 60
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(backoff)
         try:
-            if not archiver.over_limit():
-                continue
-            async with _export_lock:
-                built = await asyncio.to_thread(archiver.build_zip)
-                if built is None:
+            if pending is None:
+                if not archiver.over_limit():
+                    backoff = 60
                     continue
-                zip_path, part_files, media_files = built
-                size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+                pending = await asyncio.to_thread(archiver.build_zip)
+                if pending is None:
+                    backoff = 60
+                    continue
 
-                if _notify_client is None or _notify_to is None:
-                    archiver.discard_zip(zip_path)
-                    continue
-                try:
-                    await _notify_client.send_file(
-                        _notify_to,
-                        zip_path,
-                        caption=(
-                            f"📦 Экспорт Tg-skaner (~{size_mb:.0f} МБ). "
-                            "Локальные копии очищены для освобождения диска."
-                        ),
-                    )
-                    archiver.cleanup_after_send(part_files, media_files, zip_path)
-                    log.info("Экспорт отправлен (~%.0f МБ), локальные копии очищены.", size_mb)
-                except Exception as exc:  # noqa: BLE001
-                    archiver.discard_zip(zip_path)
-                    log.error(
-                        "Не удалось отправить экспорт — данные оставлены до "
-                        "следующей попытки: %s",
-                        exc,
-                    )
+            zip_path, part_files, media_files = pending
+            if _notify_client is None or _notify_to is None:
+                backoff = min(backoff * 2, 3600)  # некуда слать — ждём, zip храним
+                continue
+
+            size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+            try:
+                await _notify_client.send_file(
+                    _notify_to,
+                    zip_path,
+                    caption=(
+                        f"📦 Экспорт Tg-skaner (~{size_mb:.0f} МБ). "
+                        "Локальные копии очищены для освобождения диска."
+                    ),
+                )
+                archiver.cleanup_after_send(part_files, media_files, zip_path)
+                log.info("Экспорт отправлен (~%.0f МБ), локальные копии очищены.", size_mb)
+                pending = None
+                backoff = 60
+            except Exception as exc:  # noqa: BLE001
+                # zip сохраняем и повторим его же позже; данные не теряются.
+                backoff = min(backoff * 2, 3600)
+                log.error(
+                    "Не удалось отправить экспорт — повторю через %s c: %s",
+                    backoff, exc,
+                )
         except Exception as exc:  # noqa: BLE001
+            backoff = min(backoff * 2, 3600)
             log.warning("Ошибка экспорта: %s", exc)
 
 
@@ -349,6 +367,15 @@ async def main() -> None:
     user.add_event_handler(on_deleted, events.MessageDeleted())
     if bot is not None:
         bot.add_event_handler(on_start, events.NewMessage(pattern=r"^/start"))
+
+    # Подчищаем недокачанные файлы, оставшиеся от прошлого (упавшего) запуска.
+    for name in os.listdir(MEDIA_TMP):
+        try:
+            fp = os.path.join(MEDIA_TMP, name)
+            if os.path.isfile(fp):
+                os.remove(fp)
+        except OSError:
+            pass
 
     asyncio.create_task(retention_loop())
     if archiver is not None:

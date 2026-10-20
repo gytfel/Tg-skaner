@@ -58,6 +58,16 @@ def load_config() -> Config:
     except ValueError as exc:
         raise SystemExit("OWNER_ID должен быть числом (или пустым).") from exc
 
+    try:
+        retention_days = int(os.getenv("RETENTION_DAYS", "7").strip() or "7")
+    except ValueError as exc:
+        raise SystemExit("RETENTION_DAYS должен быть числом.") from exc
+
+    try:
+        export_limit_mb = int(os.getenv("EXPORT_LIMIT_MB", "100").strip() or "100")
+    except ValueError as exc:
+        raise SystemExit("EXPORT_LIMIT_MB должен быть числом.") from exc
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash.strip(),
@@ -66,10 +76,10 @@ def load_config() -> Config:
         owner_id=owner_id,
         log_chat=os.getenv("LOG_CHAT", "me").strip(),
         save_media=_as_bool(os.getenv("SAVE_MEDIA"), True),
-        retention_days=int(os.getenv("RETENTION_DAYS", "7")),
+        retention_days=retention_days,
         ignore_outgoing=_as_bool(os.getenv("IGNORE_OUTGOING"), False),
         export_enabled=_as_bool(os.getenv("EXPORT_ENABLED"), True),
-        export_limit_mb=int(os.getenv("EXPORT_LIMIT_MB", "100")),
+        export_limit_mb=export_limit_mb,
     )
 
 
