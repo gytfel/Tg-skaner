@@ -105,7 +105,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$RUN_USER
-WorkingDirectory="$APP_DIR"
+WorkingDirectory=$APP_DIR
 ExecStart="$VENV/bin/python" "$APP_DIR/bot.py"
 Restart=always
 RestartSec=10
