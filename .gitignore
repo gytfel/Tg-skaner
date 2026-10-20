@@ -5,10 +5,11 @@ env/.env
 *.session
 *.session-journal
 
-# Локальная база сообщений и скачанные медиа
+# Локальная база сообщений, скачанные медиа и архив/экспорт
 *.db
 *.db-journal
 media/
+export/
 
 # Python
 __pycache__/

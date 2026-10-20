@@ -33,6 +33,8 @@ class Config:
     save_media: bool
     retention_days: int
     ignore_outgoing: bool
+    export_enabled: bool
+    export_limit_mb: int
 
 
 def load_config() -> Config:
@@ -66,6 +68,8 @@ def load_config() -> Config:
         save_media=_as_bool(os.getenv("SAVE_MEDIA"), True),
         retention_days=int(os.getenv("RETENTION_DAYS", "7")),
         ignore_outgoing=_as_bool(os.getenv("IGNORE_OUTGOING"), False),
+        export_enabled=_as_bool(os.getenv("EXPORT_ENABLED"), True),
+        export_limit_mb=int(os.getenv("EXPORT_LIMIT_MB", "100")),
     )
 
 

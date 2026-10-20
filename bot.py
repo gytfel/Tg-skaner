@@ -25,6 +25,7 @@ from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.utils import get_display_name
 
+from archive import Archiver
 from config import load_config, resolve_log_chat
 from db import MessageStore
 
@@ -43,6 +44,13 @@ store = MessageStore("messages.db")
 
 MEDIA_DIR = "media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
+
+EXPORT_DIR = "export"
+# Единый архив всех копий + автоэкспорт по лимиту (если включён).
+archiver = (
+    Archiver(EXPORT_DIR, MEDIA_DIR, cfg.export_limit_mb) if cfg.export_enabled else None
+)
+_export_lock = asyncio.Lock()
 
 # Клиент-пользователь: ловит сообщения в ваших чатах.
 user = TelegramClient(cfg.session_name, cfg.api_id, cfg.api_hash)
@@ -130,14 +138,35 @@ async def cache_new(event: events.NewMessage.Event) -> None:
     )
 
     # Медиа качаем уже после сохранения строки; путь дописываем по готовности.
+    media_path: str | None = None
     if cfg.save_media and msg.media:
         try:
             prefix = os.path.join(MEDIA_DIR, f"{event.chat_id}_{msg.id}")
             path = await msg.download_media(file=prefix)
             if path:
                 store.update_media(event.chat_id, msg.id, path)
+                media_path = path
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось скачать медиа: %s", exc)
+
+    # Копия в единый архив (все сообщения, не только удалённые).
+    if archiver is not None:
+        try:
+            archiver.append(
+                {
+                    "ts": int(msg.date.timestamp()) if msg.date else int(time.time()),
+                    "chat_id": event.chat_id,
+                    "chat": get_display_name(chat) if chat else None,
+                    "sender_id": getattr(sender, "id", None),
+                    "sender": get_display_name(sender) if sender else None,
+                    "username": getattr(sender, "username", None),
+                    "outgoing": bool(msg.out),
+                    "text": msg.message or "",
+                    "media": media_path,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось записать в архив: %s", exc)
 
 
 async def on_edited(event: events.MessageEdited.Event) -> None:
@@ -178,7 +207,10 @@ async def on_deleted(event: events.MessageDeleted.Event) -> None:
         body = _header(row, "🗑", "Удалённое сообщение")
         body += f"\n\n{text}" if text else "\n\n<i>(без текста)</i>"
         if row["media_path"]:
-            body += "\n\n📎 <i>медиа восстановлено ниже</i>"
+            if os.path.exists(row["media_path"]):
+                body += "\n\n📎 <i>медиа восстановлено ниже</i>"
+            else:
+                body += "\n\n📎 <i>медиа — в экспортном архиве</i>"
         await _send(body, row["media_path"])
         log.info("Зафиксировано удаление: chat=%s msg=%s", row["chat_id"], mid)
 
@@ -207,6 +239,48 @@ async def retention_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("Очистка кэша не удалась: %s", exc)
         await asyncio.sleep(3600)
+
+
+async def export_loop() -> None:
+    """Следит за объёмом архива; при превышении лимита пакует всё в zip,
+    отправляет владельцу через бота и чистит локальные копии."""
+    if archiver is None:
+        return
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if not archiver.over_limit():
+                continue
+            async with _export_lock:
+                built = await asyncio.to_thread(archiver.build_zip)
+                if built is None:
+                    continue
+                zip_path, part_files, media_files = built
+                size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+
+                if _notify_client is None or _notify_to is None:
+                    archiver.discard_zip(zip_path)
+                    continue
+                try:
+                    await _notify_client.send_file(
+                        _notify_to,
+                        zip_path,
+                        caption=(
+                            f"📦 Экспорт Tg-skaner (~{size_mb:.0f} МБ). "
+                            "Локальные копии очищены для освобождения диска."
+                        ),
+                    )
+                    archiver.cleanup_after_send(part_files, media_files, zip_path)
+                    log.info("Экспорт отправлен (~%.0f МБ), локальные копии очищены.", size_mb)
+                except Exception as exc:  # noqa: BLE001
+                    archiver.discard_zip(zip_path)
+                    log.error(
+                        "Не удалось отправить экспорт — данные оставлены до "
+                        "следующей попытки: %s",
+                        exc,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Ошибка экспорта: %s", exc)
 
 
 # ───────────────────────────────── запуск ───────────────────────────────────
@@ -277,6 +351,9 @@ async def main() -> None:
         bot.add_event_handler(on_start, events.NewMessage(pattern=r"^/start"))
 
     asyncio.create_task(retention_loop())
+    if archiver is not None:
+        asyncio.create_task(export_loop())
+        log.info("Автоэкспорт включён: лимит %s МБ.", cfg.export_limit_mb)
     log.info("Слушаю события. Ctrl+C для остановки.")
 
     # Если любой из клиентов отвалится — выходим с ненулевым кодом, чтобы
