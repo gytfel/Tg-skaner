@@ -1,12 +1,20 @@
-"""Tg-skaner — userbot-архиватор удалённых и изменённых сообщений.
+"""Tg-skaner — userbot-архиватор переписок, удалённых и изменённых сообщений.
 
 Захват сообщений работает на вашем аккаунте через api_id/api_hash (Telethon).
-Доставка отчётов — через отдельного Telegram-бота (токен от @BotFather):
-удаления и правки прилетают вам в личку с ботом, а не в «Избранное».
-Если BOT_TOKEN не задан — откат к доставке в LOG_CHAT (по умолчанию «Избранное»).
+Доставка — через отдельного Telegram-бота (токен от @BotFather); если
+BOT_TOKEN не задан — в LOG_CHAT (по умолчанию «Избранное»).
+
+Режимы:
+  PASSIVE_MODE=true  (тихий, по умолчанию) — никаких сообщений: удаления и
+      правки только записываются в архив, а бот присылает лишь zip-файл
+      переписок, когда архив достигает EXPORT_LIMIT_MB. После доставки файла
+      данные на сервере удаляются.
+  PASSIVE_MODE=false — дополнительно каждое удаление/правка сразу приходит
+      отдельным сообщением.
 
 Логика:
-  1. Каждое входящее/исходящее сообщение кэшируется локально (SQLite).
+  1. Каждое входящее/исходящее сообщение кэшируется локально (SQLite) и
+     пишется в архив export/archive.jsonl.
   2. При удалении Telegram присылает только id — оригинал достаётся из кэша.
   3. Правки фиксируются как «было / стало».
 
@@ -40,6 +48,7 @@ log = logging.getLogger("tg-skaner")
 EXIT_NO_SESSION = 69
 
 cfg = load_config()
+PASSIVE = cfg.passive_mode
 store = MessageStore("messages.db")
 
 MEDIA_DIR = "media"
@@ -48,9 +57,12 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(MEDIA_TMP, exist_ok=True)
 
 EXPORT_DIR = "export"
-# Единый архив всех копий + автоэкспорт по лимиту (если включён).
+# Единый архив всех копий + автоэкспорт по лимиту. В тихом режиме экспорт —
+# единственный канал доставки, поэтому он включён всегда.
 archiver = (
-    Archiver(EXPORT_DIR, MEDIA_DIR, cfg.export_limit_mb) if cfg.export_enabled else None
+    Archiver(EXPORT_DIR, MEDIA_DIR, cfg.export_limit_mb)
+    if cfg.export_enabled or PASSIVE
+    else None
 )
 
 # Клиент-пользователь: ловит сообщения в ваших чатах.
@@ -65,6 +77,11 @@ bot = (
 # Куда и чем слать отчёты — заполняется в main() до регистрации хендлеров.
 _notify_client: TelegramClient | None = None
 _notify_to = None
+
+STARTUP_TEXT = (
+    "✅ <b>Tg-skaner запущен.</b>\n"
+    "Отслеживаю удаления и правки сообщений в ваших чатах."
+)
 
 
 # ─────────────────────────── вспомогательное ────────────────────────────────
@@ -106,6 +123,28 @@ async def _send(text: str, media_path: str | None = None) -> None:
             "Telegram и нажмите Start. Детали: %s",
             exc,
         )
+
+
+def _archive(record: dict) -> None:
+    """Запись в единый архив (если он включён). Ошибку только логируем."""
+    if archiver is None:
+        return
+    try:
+        archiver.append(record)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Не удалось записать в архив: %s", exc)
+
+
+def _row_fields(row) -> dict:
+    """Общие поля записи архива из строки кэша messages.db."""
+    return {
+        "chat_id": row["chat_id"],
+        "chat": row["chat_title"],
+        "sender_id": row["sender_id"],
+        "sender": row["sender_name"],
+        "username": row["sender_username"],
+        "outgoing": bool(row["outgoing"]),
+    }
 
 
 # ─────────────────────────── хендлеры (user) ────────────────────────────────
@@ -155,27 +194,25 @@ async def cache_new(event: events.NewMessage.Event) -> None:
             log.warning("Не удалось скачать медиа: %s", exc)
 
     # Копия в единый архив (все сообщения, не только удалённые).
-    if archiver is not None:
-        try:
-            archiver.append(
-                {
-                    "ts": int(msg.date.timestamp()) if msg.date else int(time.time()),
-                    "chat_id": event.chat_id,
-                    "chat": get_display_name(chat) if chat else None,
-                    "sender_id": getattr(sender, "id", None),
-                    "sender": get_display_name(sender) if sender else None,
-                    "username": getattr(sender, "username", None),
-                    "outgoing": bool(msg.out),
-                    "text": msg.message or "",
-                    "media": media_path,
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Не удалось записать в архив: %s", exc)
+    _archive(
+        {
+            "type": "msg",
+            "ts": int(msg.date.timestamp()) if msg.date else int(time.time()),
+            "chat_id": event.chat_id,
+            "chat": get_display_name(chat) if chat else None,
+            "msg_id": msg.id,
+            "sender_id": getattr(sender, "id", None),
+            "sender": get_display_name(sender) if sender else None,
+            "username": getattr(sender, "username", None),
+            "outgoing": bool(msg.out),
+            "text": msg.message or "",
+            "media": media_path,
+        }
+    )
 
 
 async def on_edited(event: events.MessageEdited.Event) -> None:
-    """Фиксируем правки: показываем «было / стало» и обновляем кэш."""
+    """Фиксируем правки: «было / стало» — в архив (и сообщением, если не тихий режим)."""
     msg = event.message
     if cfg.ignore_outgoing and msg.out:
         return
@@ -185,18 +222,30 @@ async def on_edited(event: events.MessageEdited.Event) -> None:
     old_text = (row["text"] if row else "") or ""
 
     if row is not None and old_text != new_text:
-        body = (
-            _header(row, "✏️", "Изменённое сообщение")
-            + f"\n\n<b>Было:</b>\n{html.escape(old_text) or '<i>(пусто)</i>'}"
-            + f"\n\n<b>Стало:</b>\n{html.escape(new_text) or '<i>(пусто)</i>'}"
+        edit_date = getattr(msg, "edit_date", None)
+        _archive(
+            {
+                "type": "edit",
+                "ts": int(edit_date.timestamp()) if edit_date else int(time.time()),
+                **_row_fields(row),
+                "msg_id": msg.id,
+                "old": old_text,
+                "new": new_text,
+            }
         )
-        await _send(body)
+        if not PASSIVE:
+            body = (
+                _header(row, "✏️", "Изменённое сообщение")
+                + f"\n\n<b>Было:</b>\n{html.escape(old_text) or '<i>(пусто)</i>'}"
+                + f"\n\n<b>Стало:</b>\n{html.escape(new_text) or '<i>(пусто)</i>'}"
+            )
+            await _send(body)
 
     store.update_text(event.chat_id, msg.id, new_text)
 
 
 async def on_deleted(event: events.MessageDeleted.Event) -> None:
-    """Главное: сообщение удалили — достаём оригинал из кэша и пересылаем."""
+    """Главное: сообщение удалили — достаём оригинал из кэша и фиксируем."""
     for mid in event.deleted_ids:
         if event.chat_id is not None:
             row = store.get_by_chat(event.chat_id, mid)
@@ -208,25 +257,49 @@ async def on_deleted(event: events.MessageDeleted.Event) -> None:
         if cfg.ignore_outgoing and row["outgoing"]:
             continue
 
-        text = html.escape(row["text"] or "")
-        body = _header(row, "🗑", "Удалённое сообщение")
-        body += f"\n\n{text}" if text else "\n\n<i>(без текста)</i>"
-        if row["media_path"]:
-            if os.path.exists(row["media_path"]):
-                body += "\n\n📎 <i>медиа восстановлено ниже</i>"
-            else:
-                body += "\n\n📎 <i>медиа — в экспортном архиве</i>"
-        await _send(body, row["media_path"])
+        media = row["media_path"]
+        media_here = bool(media and os.path.exists(media))
+        _archive(
+            {
+                "type": "del",
+                "ts": int(time.time()),
+                **_row_fields(row),
+                "msg_id": mid,
+                "orig_ts": row["date"],
+                "text": row["text"] or "",
+                "media": media,
+                "media_here": media_here,
+            }
+        )
+
+        if not PASSIVE:
+            text = html.escape(row["text"] or "")
+            body = _header(row, "🗑", "Удалённое сообщение")
+            body += f"\n\n{text}" if text else "\n\n<i>(без текста)</i>"
+            if media:
+                if media_here:
+                    body += "\n\n📎 <i>медиа восстановлено ниже</i>"
+                else:
+                    body += "\n\n📎 <i>медиа — в экспортном архиве</i>"
+            await _send(body, media)
         log.info("Зафиксировано удаление: chat=%s msg=%s", row["chat_id"], mid)
 
 
 # ─────────────────────────── хендлеры (bot) ─────────────────────────────────
 
 async def on_start(event: events.NewMessage.Event) -> None:
-    await event.respond(
-        "✅ Tg-skaner на связи. Сюда будут приходить удалённые и "
-        "изменённые сообщения из ваших чатов."
-    )
+    if PASSIVE:
+        text = (
+            "✅ Tg-skaner на связи (тихий режим).\n"
+            "Сообщений не будет — сюда придёт только zip-файл с перепиской, "
+            f"когда архив накопит ~{cfg.export_limit_mb} МБ."
+        )
+    else:
+        text = (
+            "✅ Tg-skaner на связи. Сюда будут приходить удалённые и "
+            "изменённые сообщения из ваших чатов."
+        )
+    await event.respond(text)
 
 
 # ─────────────────────────── фоновая очистка ────────────────────────────────
@@ -235,20 +308,45 @@ async def retention_loop() -> None:
     while True:
         try:
             cutoff = int(time.time()) - cfg.retention_days * 86400
-            for path in store.cleanup(cutoff):
-                try:
-                    if path and os.path.exists(path):
-                        os.remove(path)
-                except OSError:
-                    pass
+            paths = store.cleanup(cutoff)
+            # С включённым экспортом медиа удаляет только он — после доставки
+            # файла. Иначе вложения пропали бы раньше, чем попали в архив.
+            if archiver is None:
+                for path in paths:
+                    try:
+                        if path and os.path.exists(path):
+                            os.remove(path)
+                    except OSError:
+                        pass
         except Exception as exc:  # noqa: BLE001
             log.warning("Очистка кэша не удалась: %s", exc)
         await asyncio.sleep(3600)
 
 
+def _export_caption(stats: dict, size_mb: float) -> str:
+    return (
+        f"📦 Архив переписок Tg-skaner (~{size_mb:.1f} МБ)\n"
+        f"Сообщений: {stats.get('msg', 0)} · удалено: {stats.get('del', 0)} · "
+        f"изменено: {stats.get('edit', 0)} · медиа: {stats.get('media', 0)}\n"
+        "Переписки — в папке «переписки». После доставки данные на сервере удалены."
+    )
+
+
+async def _deliver_export(pending) -> None:
+    """Отправляет собранный zip и только после успешной доставки чистит диск.
+    Исключение пробрасывается — вызывающий код повторит отправку позже."""
+    zip_path, part_files, media_files, stats = pending
+    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    await _notify_client.send_file(
+        _notify_to, zip_path, caption=_export_caption(stats, size_mb)
+    )
+    archiver.cleanup_after_send(part_files, media_files, zip_path)
+    log.info("Экспорт отправлен (~%.1f МБ), данные на сервере очищены.", size_mb)
+
+
 async def export_loop() -> None:
     """Следит за объёмом архива; при превышении лимита пакует всё в zip,
-    отправляет владельцу через бота и чистит локальные копии.
+    отправляет владельцу и чистит локальные копии.
 
     При сбое отправки НЕ пересобирает zip каждый цикл (иначе шторм упаковки и
     рост .part при оффлайне), а держит готовый zip и повторяет отправку того же
@@ -256,7 +354,7 @@ async def export_loop() -> None:
     """
     if archiver is None:
         return
-    pending = None   # (zip_path, part_files, media_files) — собранный, но не отправленный
+    pending = None  # (zip_path, part_files, media_files, stats) — собран, не отправлен
     backoff = 60
     while True:
         await asyncio.sleep(backoff)
@@ -270,23 +368,12 @@ async def export_loop() -> None:
                     backoff = 60
                     continue
 
-            zip_path, part_files, media_files = pending
             if _notify_client is None or _notify_to is None:
                 backoff = min(backoff * 2, 3600)  # некуда слать — ждём, zip храним
                 continue
 
-            size_mb = os.path.getsize(zip_path) / (1024 * 1024)
             try:
-                await _notify_client.send_file(
-                    _notify_to,
-                    zip_path,
-                    caption=(
-                        f"📦 Экспорт Tg-skaner (~{size_mb:.0f} МБ). "
-                        "Локальные копии очищены для освобождения диска."
-                    ),
-                )
-                archiver.cleanup_after_send(part_files, media_files, zip_path)
-                log.info("Экспорт отправлен (~%.0f МБ), локальные копии очищены.", size_mb)
+                await _deliver_export(pending)
                 pending = None
                 backoff = 60
             except Exception as exc:  # noqa: BLE001
@@ -335,30 +422,32 @@ async def main() -> None:
         _notify_to = cfg.owner_id or me.id
         coros.append(bot.run_until_disconnected())
         log.info("Доставка через бота @%s -> id %s", bot_me.username, _notify_to)
-        # Стартовое сообщение — громко, чтобы недоступность бота была видна.
-        try:
-            await bot.send_message(
-                _notify_to,
-                "✅ <b>Tg-skaner запущен.</b>\n"
-                "Отслеживаю удаления и правки сообщений в ваших чатах.",
-                parse_mode="html",
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.error(
-                "Бот @%s не может написать id %s. Откройте бота в Telegram, "
-                "нажмите Start и перезапустите сервис. Детали: %s",
-                bot_me.username,
-                _notify_to,
-                exc,
-            )
+        if PASSIVE:
+            # Тихий режим: ничего не пишем, только проверяем, что бот знает вас.
+            try:
+                await bot.get_input_entity(_notify_to)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Бот @%s, похоже, ещё не может писать id %s — откройте бота в "
+                    "Telegram и нажмите Start (перезапуск не нужен). Детали: %s",
+                    bot_me.username, _notify_to, exc,
+                )
+        else:
+            # Стартовое сообщение — громко, чтобы недоступность бота была видна.
+            try:
+                await bot.send_message(_notify_to, STARTUP_TEXT, parse_mode="html")
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "Бот @%s не может написать id %s. Откройте бота в Telegram, "
+                    "нажмите Start и перезапустите сервис. Детали: %s",
+                    bot_me.username, _notify_to, exc,
+                )
     else:
         _notify_client = user
         _notify_to = resolve_log_chat(cfg.log_chat)
         log.info("Доставка в LOG_CHAT: %s", cfg.log_chat)
-        await _send(
-            "✅ <b>Tg-skaner запущен.</b>\n"
-            "Отслеживаю удаления и правки сообщений в ваших чатах."
-        )
+        if not PASSIVE:
+            await _send(STARTUP_TEXT)
 
     # Хендлеры регистрируем только когда цель доставки уже готова —
     # иначе событие в момент старта ушло бы «в никуда».
@@ -376,11 +465,17 @@ async def main() -> None:
                 os.remove(fp)
         except OSError:
             pass
+    if archiver is not None:
+        archiver.clean_stale()
 
     asyncio.create_task(retention_loop())
     if archiver is not None:
         asyncio.create_task(export_loop())
-        log.info("Автоэкспорт включён: лимит %s МБ.", cfg.export_limit_mb)
+        log.info(
+            "%s Автоэкспорт: файл приходит при ~%s МБ.",
+            "Тихий режим: сообщений не будет." if PASSIVE else "Обычный режим.",
+            cfg.export_limit_mb,
+        )
     log.info("Слушаю события. Ctrl+C для остановки.")
 
     # Если любой из клиентов отвалится — выходим с ненулевым кодом, чтобы

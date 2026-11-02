@@ -35,6 +35,7 @@ class Config:
     ignore_outgoing: bool
     export_enabled: bool
     export_limit_mb: int
+    passive_mode: bool
 
 
 def load_config() -> Config:
@@ -80,6 +81,7 @@ def load_config() -> Config:
         ignore_outgoing=_as_bool(os.getenv("IGNORE_OUTGOING"), False),
         export_enabled=_as_bool(os.getenv("EXPORT_ENABLED"), True),
         export_limit_mb=export_limit_mb,
+        passive_mode=_as_bool(os.getenv("PASSIVE_MODE"), True),
     )
 
 
