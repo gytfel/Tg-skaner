@@ -239,7 +239,7 @@ def _txt_media(r: dict, media_names: set[str]) -> str | None:
     name = f" «{r['file_name']}»" if r.get("file_name") else ""
     if base in media_names:
         return f"📎 {kind}{name}: media/{base}"
-    return f"📎 {kind}{name}: {base} — в другом архиве"
+    return f"📎 {kind}{name}: media/{base} — в соседнем архиве"
 
 
 def txt_record(r: dict, clock: Clock, media_names: set[str]) -> str:
@@ -401,7 +401,11 @@ def _html_media(r: dict, media_names: set[str]) -> str:
     base = os.path.basename(media)
     label = r.get("file_name") or base
     if base not in media_names:
-        return f'<div class="note">📎 {_esc(kind)} «{_esc(label)}» — в другом архиве ({_esc(base)})</div>'
+        return (
+            f'<div class="note">📎 {_esc(kind)} «{_esc(label)}» — в соседнем архиве. '
+            f'Распакуйте архивы в одну папку, и файл откроется по ссылке: '
+            f'<a href="../media/{quote(base)}">{_esc(base)}</a></div>'
+        )
     src = "../media/" + quote(base)
     ext = os.path.splitext(base)[1].lower()
     if ext in _IMG:

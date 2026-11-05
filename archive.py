@@ -63,6 +63,10 @@ class Archiver:
                 limit_mb, MAX_LIMIT_MB, effective,
             )
         self.limit_bytes = effective * 1024 * 1024
+        # Порция медиа в одном zip: с запасом над порогом, чтобы в обычном
+        # режиме (порог только что превышен) всё уходило одним файлом и фото не
+        # отрывались от своих сообщений. Делится только большой накопленный объём.
+        self.chunk_bytes = min(self.limit_bytes * 3 // 2, MAX_LIMIT_MB * 1024 * 1024)
         self.archive_path = os.path.join(export_dir, "archive.jsonl")
         # threading.Lock: append() идёт из event-loop, build_zip() — из рабочего
         # потока (to_thread); обычный asyncio.Lock их бы не синхронизировал.
@@ -180,7 +184,7 @@ class Archiver:
 
         part_files = self._part_files()
         if media_budget is None:
-            media_budget = self.limit_bytes
+            media_budget = self.chunk_bytes
         media_files = self._pick_media(media_budget)
         if not part_files and not media_files:
             return None

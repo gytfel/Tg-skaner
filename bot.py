@@ -590,7 +590,7 @@ async def export_loop() -> None:
                     continue
                 # Порция не больше лимита и не больше, чем реально влезет на диск.
                 budget = min(
-                    archiver.limit_bytes,
+                    archiver.chunk_bytes,
                     max(MB, archiver.free_bytes() - EMERGENCY_FREE),
                 )
                 try:
