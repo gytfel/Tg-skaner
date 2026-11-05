@@ -10,6 +10,10 @@
 
 zip отправляется владельцу, после чего локальные копии удаляются.
 messages.db (детекция удалений) не трогается.
+
+Медиа выгружается порциями не больше лимита: один zip не превышает
+EXPORT_LIMIT_MB, поэтому для сборки нужно мало свободного места, а
+накопившийся «хвост» уходит несколькими файлами подряд.
 """
 from __future__ import annotations
 
@@ -63,7 +67,8 @@ def _who(r: dict) -> str:
 def _media_note(r: dict) -> str:
     media = r.get("media")
     if not media:
-        return ""
+        skipped = r.get("media_skipped")
+        return f" [медиа не сохранено: {skipped}]" if skipped else ""
     base = os.path.basename(media)
     if r.get("media_here", True):
         return f" [медиа: media/{base}]"
@@ -143,15 +148,60 @@ class Archiver:
     def over_limit(self) -> bool:
         return self.total_bytes() >= self.limit_bytes
 
+    def free_bytes(self) -> int:
+        """Свободное место на диске, где лежит архив."""
+        try:
+            return shutil.disk_usage(self.export_dir).free
+        except OSError:
+            return 0
+
     # ─────────────────────────── экспорт ───────────────────────────────────
     def _list_media(self) -> list[str]:
+        """Файлы медиа, от старых к новым (чтобы уходили в порядке появления)."""
         if not os.path.isdir(self.media_dir):
             return []
-        return [
-            os.path.join(self.media_dir, n)
-            for n in os.listdir(self.media_dir)
-            if os.path.isfile(os.path.join(self.media_dir, n))
-        ]
+        items = []
+        for n in os.listdir(self.media_dir):
+            fp = os.path.join(self.media_dir, n)
+            try:
+                if os.path.isfile(fp):
+                    items.append((os.path.getmtime(fp), fp))
+            except OSError:
+                pass
+        return [fp for _, fp in sorted(items)]
+
+    def _pick_media(self, budget: int) -> list[str]:
+        """Берёт самые старые медиа, пока суммарно влезают в budget байт.
+        Хотя бы один файл берём всегда — иначе крупный файл застрял бы навсегда."""
+        picked: list[str] = []
+        total = 0
+        for m in self._list_media():
+            try:
+                size = os.path.getsize(m)
+            except OSError:
+                continue
+            if picked and total + size > budget:
+                break
+            picked.append(m)
+            total += size
+        return picked
+
+    def drop_oldest_media(self, need_bytes: int) -> tuple[int, int]:
+        """Аварийно удаляет самые старые медиа, чтобы освободить need_bytes.
+        Используется, только когда диск почти заполнен и иначе бот встанет.
+        Возвращает (сколько файлов удалено, сколько байт освобождено)."""
+        count = freed = 0
+        for m in self._list_media():
+            if freed >= need_bytes:
+                break
+            try:
+                size = os.path.getsize(m)
+                os.remove(m)
+                count += 1
+                freed += size
+            except OSError:
+                pass
+        return count, freed
 
     def render_chats(self, part_files: list[str], out_dir: str) -> dict:
         """Раскладывает записи по файлам-перепискам (по чату), потоково —
@@ -197,8 +247,11 @@ class Archiver:
                 h.close()
         return stats
 
-    def build_zip(self):
+    def build_zip(self, media_budget: int | None = None):
         """Готовит zip к отправке (блокирующая операция — вызывать в to_thread).
+
+        media_budget — сколько байт медиа положить в этот zip (по умолчанию —
+        лимит экспорта). Остальное медиа уйдёт следующими файлами.
 
         Возвращает (zip_path, written_parts, written_media, stats) либо None,
         если экспортировать нечего. Пишем во временный файл и переименовываем —
@@ -214,7 +267,9 @@ class Archiver:
                 )
 
         part_files = self._part_files()
-        media_files = self._list_media()
+        if media_budget is None:
+            media_budget = self.limit_bytes
+        media_files = self._pick_media(media_budget)
         if not part_files and not media_files:
             return None
 
@@ -227,7 +282,9 @@ class Archiver:
         try:
             os.makedirs(render_dir, exist_ok=True)
             stats = self.render_chats(part_files, render_dir)
-            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(
+                tmp_path, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False
+            ) as zf:
                 for name in sorted(os.listdir(render_dir)):
                     zf.write(os.path.join(render_dir, name), arcname=f"переписки/{name}")
                 for p in part_files:

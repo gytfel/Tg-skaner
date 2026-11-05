@@ -22,6 +22,16 @@ def _as_bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _as_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} должен быть числом.") from exc
+
+
 @dataclass(frozen=True)
 class Config:
     api_id: int
@@ -36,6 +46,9 @@ class Config:
     export_enabled: bool
     export_limit_mb: int
     passive_mode: bool
+    max_media_mb: int
+    archive_channels: bool
+    min_free_mb: int
 
 
 def load_config() -> Config:
@@ -69,6 +82,9 @@ def load_config() -> Config:
     except ValueError as exc:
         raise SystemExit("EXPORT_LIMIT_MB должен быть числом.") from exc
 
+    max_media_mb = _as_int("MAX_MEDIA_MB", 50)
+    min_free_mb = _as_int("MIN_FREE_MB", 1024)
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash.strip(),
@@ -82,6 +98,9 @@ def load_config() -> Config:
         export_enabled=_as_bool(os.getenv("EXPORT_ENABLED"), True),
         export_limit_mb=export_limit_mb,
         passive_mode=_as_bool(os.getenv("PASSIVE_MODE"), True),
+        max_media_mb=max(0, max_media_mb),
+        archive_channels=_as_bool(os.getenv("ARCHIVE_CHANNELS"), False),
+        min_free_mb=max(0, min_free_mb),
     )
 
 

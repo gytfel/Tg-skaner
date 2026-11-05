@@ -23,9 +23,12 @@ BOT_TOKEN не задан — в LOG_CHAT (по умолчанию «Избра�
 from __future__ import annotations
 
 import asyncio
+import errno
+import glob
 import html
 import logging
 import os
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -46,6 +49,18 @@ log = logging.getLogger("tg-skaner")
 
 # Код выхода, который говорит systemd НЕ перезапускать сервис (нет сессии).
 EXIT_NO_SESSION = 69
+
+MB = 1024 * 1024
+# Ниже этого запаса свободного места включается аварийный режим: самые старые
+# медиа удаляются, чтобы бот не встал из-за полного диска.
+EMERGENCY_FREE = 150 * MB
+# Сторожевой таймер: как часто проверять связь с Telegram и сколько подряд
+# неудач терпеть, прежде чем перезапуститься (systemd поднимет процесс заново).
+WATCHDOG_EVERY = 300
+WATCHDOG_MAX_FAILS = 3
+# Если событий нет так долго — считаем, что поток обновлений «залип», и
+# перезапускаемся (Telethon иногда молча перестаёт получать апдейты).
+STALL_SECONDS = 4 * 3600
 
 cfg = load_config()
 PASSIVE = cfg.passive_mode
@@ -77,6 +92,13 @@ bot = (
 # Куда и чем слать отчёты — заполняется в main() до регистрации хендлеров.
 _notify_client: TelegramClient | None = None
 _notify_to = None
+
+# Время последнего события (для сторожевого таймера и /status).
+_last_event = time.monotonic()
+_started = time.monotonic()
+# Когда последний раз писали в лог о пропуске медиа (чтобы не спамить).
+_last_skip_log = 0.0
+_last_export_ok: float | None = None
 
 STARTUP_TEXT = (
     "✅ <b>Tg-skaner запущен.</b>\n"
@@ -147,10 +169,51 @@ def _row_fields(row) -> dict:
     }
 
 
+def _free_bytes() -> int:
+    try:
+        return shutil.disk_usage(".").free
+    except OSError:
+        return 0
+
+
+def _media_skip_reason(msg) -> str | None:
+    """Почему медиа НЕ качаем (или None — качаем). Главная защита диска."""
+    size = getattr(msg.file, "size", None) if msg.file else None
+    if cfg.max_media_mb and size and size > cfg.max_media_mb * MB:
+        return f"{size / MB:.0f} МБ > лимита MAX_MEDIA_MB={cfg.max_media_mb}"
+    need = cfg.min_free_mb * MB + (size or 0)
+    if _free_bytes() < need:
+        return f"мало места на диске (< {cfg.min_free_mb} МБ свободно)"
+    return None
+
+
+def _log_skip(reason: str) -> None:
+    global _last_skip_log
+    now = time.monotonic()
+    if now - _last_skip_log > 600:  # не чаще раза в 10 минут
+        _last_skip_log = now
+        log.warning("Медиа пропущено: %s", reason)
+
+
+def _remove_partial(prefix: str) -> None:
+    """Удаляет недокачанный файл после ошибки загрузки. Telethon дописывает
+    к имени расширение («<prefix>.jpg»), поэтому ищем ровно prefix и prefix.*
+    (а не prefix* — иначе задели бы «<chat>_45…» при удалении «<chat>_4»)."""
+    for fp in [prefix, *glob.glob(glob.escape(prefix) + ".*")]:
+        if not os.path.isfile(fp):
+            continue
+        try:
+            os.remove(fp)
+        except OSError:
+            pass
+
+
 # ─────────────────────────── хендлеры (user) ────────────────────────────────
 
 async def cache_new(event: events.NewMessage.Event) -> None:
     """Сохраняем каждое проходящее сообщение в кэш."""
+    global _last_event
+    _last_event = time.monotonic()
     msg = event.message
     if cfg.ignore_outgoing and msg.out:
         return
@@ -160,6 +223,11 @@ async def cache_new(event: events.NewMessage.Event) -> None:
         chat = await event.get_chat()
     except Exception:  # noqa: BLE001
         sender = chat = None
+
+    # Каналы-ленты (не группы) — это не переписки, а основной источник
+    # гигабайтов медиа. По умолчанию их пропускаем (ARCHIVE_CHANNELS=false).
+    if not cfg.archive_channels and getattr(chat, "broadcast", False):
+        return
 
     # Сначала фиксируем текст и метаданные — они не должны зависеть от того,
     # успеет ли докачаться медиа до возможного удаления.
@@ -181,17 +249,24 @@ async def cache_new(event: events.NewMessage.Event) -> None:
     # Качаем во временную папку и переносим в media/ атомарно — чтобы экспорт
     # никогда не увидел и не удалил недокачанный файл.
     media_path: str | None = None
+    media_skipped: str | None = None
     if cfg.save_media and msg.media:
-        try:
+        media_skipped = _media_skip_reason(msg)
+        if media_skipped:
+            _log_skip(media_skipped)
+        else:
             tmp_prefix = os.path.join(MEDIA_TMP, f"{event.chat_id}_{msg.id}")
-            tmp_path = await msg.download_media(file=tmp_prefix)
-            if tmp_path:
-                final_path = os.path.join(MEDIA_DIR, os.path.basename(tmp_path))
-                os.replace(tmp_path, final_path)  # атомарно (та же ФС)
-                store.update_media(event.chat_id, msg.id, final_path)
-                media_path = final_path
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Не удалось скачать медиа: %s", exc)
+            try:
+                tmp_path = await msg.download_media(file=tmp_prefix)
+                if tmp_path:
+                    final_path = os.path.join(MEDIA_DIR, os.path.basename(tmp_path))
+                    os.replace(tmp_path, final_path)  # атомарно (та же ФС)
+                    store.update_media(event.chat_id, msg.id, final_path)
+                    media_path = final_path
+            except Exception as exc:  # noqa: BLE001
+                _remove_partial(tmp_prefix)  # не оставляем мусор на диске
+                media_skipped = "ошибка загрузки"
+                log.warning("Не удалось скачать медиа: %s", exc)
 
     # Копия в единый архив (все сообщения, не только удалённые).
     _archive(
@@ -207,12 +282,15 @@ async def cache_new(event: events.NewMessage.Event) -> None:
             "outgoing": bool(msg.out),
             "text": msg.message or "",
             "media": media_path,
+            "media_skipped": media_skipped,
         }
     )
 
 
 async def on_edited(event: events.MessageEdited.Event) -> None:
     """Фиксируем правки: «было / стало» — в архив (и сообщением, если не тихий режим)."""
+    global _last_event
+    _last_event = time.monotonic()
     msg = event.message
     if cfg.ignore_outgoing and msg.out:
         return
@@ -246,6 +324,8 @@ async def on_edited(event: events.MessageEdited.Event) -> None:
 
 async def on_deleted(event: events.MessageDeleted.Event) -> None:
     """Главное: сообщение удалили — достаём оригинал из кэша и фиксируем."""
+    global _last_event
+    _last_event = time.monotonic()
     for mid in event.deleted_ids:
         if event.chat_id is not None:
             row = store.get_by_chat(event.chat_id, mid)
@@ -302,6 +382,33 @@ async def on_start(event: events.NewMessage.Event) -> None:
     await event.respond(text)
 
 
+def _ago(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 120:
+        return f"{seconds} с"
+    if seconds < 7200:
+        return f"{seconds // 60} мин"
+    return f"{seconds // 3600} ч {seconds % 3600 // 60} мин"
+
+
+async def on_status(event: events.NewMessage.Event) -> None:
+    """/status — короткая сводка о здоровье бота (только владельцу)."""
+    if event.sender_id != _notify_to:
+        return
+    now = time.monotonic()
+    data = archiver.total_bytes() / MB if archiver else 0.0
+    last_export = _ago(now - _last_export_ok) + " назад" if _last_export_ok else "ещё не было"
+    text = (
+        "📊 Tg-skaner\n"
+        f"Работает: {_ago(now - _started)}\n"
+        f"Последнее событие: {_ago(now - _last_event)} назад\n"
+        f"Свободно на диске: {_free_bytes() / MB:.0f} МБ\n"
+        f"Ждёт выгрузки: {data:.1f} МБ (порог {cfg.export_limit_mb} МБ)\n"
+        f"Последний экспорт: {last_export}"
+    )
+    await event.respond(text)
+
+
 # ─────────────────────────── фоновая очистка ────────────────────────────────
 
 async def retention_loop() -> None:
@@ -335,57 +442,129 @@ def _export_caption(stats: dict, size_mb: float) -> str:
 async def _deliver_export(pending) -> None:
     """Отправляет собранный zip и только после успешной доставки чистит диск.
     Исключение пробрасывается — вызывающий код повторит отправку позже."""
+    global _last_export_ok
     zip_path, part_files, media_files, stats = pending
-    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-    await _notify_client.send_file(
-        _notify_to, zip_path, caption=_export_caption(stats, size_mb)
+    size_mb = os.path.getsize(zip_path) / MB
+    # Таймаут, чтобы зависшая выгрузка не держала экспорт (и диск) вечно.
+    timeout = 600 + size_mb * 30
+    await asyncio.wait_for(
+        _notify_client.send_file(
+            _notify_to, zip_path, caption=_export_caption(stats, size_mb)
+        ),
+        timeout=timeout,
     )
     archiver.cleanup_after_send(part_files, media_files, zip_path)
+    _last_export_ok = time.monotonic()
     log.info("Экспорт отправлен (~%.1f МБ), данные на сервере очищены.", size_mb)
 
 
-async def export_loop() -> None:
-    """Следит за объёмом архива; при превышении лимита пакует всё в zip,
-    отправляет владельцу и чистит локальные копии.
+def _emergency_free_disk() -> None:
+    """Если диск почти полон — удаляем самые старые медиа. Лучше потерять
+    часть вложений, чем получить «мёртвого» бота, который ничего не пишет."""
+    free = archiver.free_bytes()
+    if free >= EMERGENCY_FREE:
+        return
+    count, freed = archiver.drop_oldest_media(2 * EMERGENCY_FREE - free)
+    log.error(
+        "Диск почти заполнен (свободно %.0f МБ): удалено %s старых медиа "
+        "(%.0f МБ), чтобы бот продолжил работу.",
+        free / MB, count, freed / MB,
+    )
 
-    При сбое отправки НЕ пересобирает zip каждый цикл (иначе шторм упаковки и
-    рост .part при оффлайне), а держит готовый zip и повторяет отправку того же
-    файла с экспоненциальной паузой.
+
+async def export_loop() -> None:
+    """Следит за объёмом архива; при превышении лимита (или когда на диске
+    мало места) пакует данные в zip, отправляет владельцу и чистит копии.
+
+    Медиа уходит порциями не больше лимита, поэтому сборка zip не требует
+    много свободного места, а накопившийся объём выгружается несколькими
+    файлами подряд. При сбое отправки держим готовый zip и повторяем его же
+    с экспоненциальной паузой (а скачивание нового медиа само остановится,
+    если места станет мало — см. MIN_FREE_MB).
     """
     if archiver is None:
         return
     pending = None  # (zip_path, part_files, media_files, stats) — собран, не отправлен
+    delay = 60
     backoff = 60
     while True:
-        await asyncio.sleep(backoff)
+        await asyncio.sleep(delay)
+        delay = 60
         try:
+            _emergency_free_disk()
             if pending is None:
-                if not archiver.over_limit():
-                    backoff = 60
+                low_disk = archiver.free_bytes() < cfg.min_free_mb * MB
+                # При нехватке места выгружаем раньше лимита, но не по крохам.
+                early = low_disk and archiver.total_bytes() >= min(
+                    archiver.limit_bytes, 20 * MB
+                )
+                if not (archiver.over_limit() or early):
                     continue
-                pending = await asyncio.to_thread(archiver.build_zip)
+                # Порция не больше лимита и не больше, чем реально влезет на диск.
+                budget = min(
+                    archiver.limit_bytes,
+                    max(MB, archiver.free_bytes() - EMERGENCY_FREE),
+                )
+                try:
+                    pending = await asyncio.to_thread(archiver.build_zip, budget)
+                except OSError as exc:
+                    if exc.errno == errno.ENOSPC:
+                        log.error("Нет места для сборки zip — освобождаю диск.")
+                        archiver.drop_oldest_media(archiver.limit_bytes)
+                        delay = 5
+                        continue
+                    raise
                 if pending is None:
-                    backoff = 60
                     continue
 
             if _notify_client is None or _notify_to is None:
                 backoff = min(backoff * 2, 3600)  # некуда слать — ждём, zip храним
+                delay = backoff
                 continue
 
             try:
                 await _deliver_export(pending)
                 pending = None
                 backoff = 60
+                delay = 5  # сразу проверяем, не осталось ли ещё порций
             except Exception as exc:  # noqa: BLE001
                 # zip сохраняем и повторим его же позже; данные не теряются.
                 backoff = min(backoff * 2, 3600)
+                delay = backoff
                 log.error(
-                    "Не удалось отправить экспорт — повторю через %s c: %s",
+                    "Не удалось отправить экспорт — повторю через %s c: %r",
                     backoff, exc,
                 )
         except Exception as exc:  # noqa: BLE001
             backoff = min(backoff * 2, 3600)
-            log.warning("Ошибка экспорта: %s", exc)
+            delay = backoff
+            log.warning("Ошибка экспорта: %r", exc)
+
+
+async def watchdog_loop() -> None:
+    """Проверяет, что связь с Telegram жива и события идут. Если нет —
+    завершается, и main() выходит с ошибкой, чтобы systemd перезапустил бота
+    (раньше процесс мог «висеть» живым, но ничего не делать)."""
+    fails = 0
+    while True:
+        await asyncio.sleep(WATCHDOG_EVERY)
+        try:
+            await asyncio.wait_for(user.get_me(), timeout=60)
+            if bot is not None:
+                await asyncio.wait_for(bot.get_me(), timeout=60)
+            fails = 0
+        except Exception as exc:  # noqa: BLE001
+            fails += 1
+            log.warning("Нет связи с Telegram (%s/%s): %r", fails, WATCHDOG_MAX_FAILS, exc)
+            if fails >= WATCHDOG_MAX_FAILS:
+                log.error("Связь не восстановилась — перезапуск.")
+                return
+        if time.monotonic() - _last_event > STALL_SECONDS:
+            log.error(
+                "Событий нет уже %s — похоже, поток обновлений завис. Перезапуск.",
+                _ago(time.monotonic() - _last_event),
+            )
+            return
 
 
 # ───────────────────────────────── запуск ───────────────────────────────────
@@ -456,6 +635,7 @@ async def main() -> None:
     user.add_event_handler(on_deleted, events.MessageDeleted())
     if bot is not None:
         bot.add_event_handler(on_start, events.NewMessage(pattern=r"^/start"))
+        bot.add_event_handler(on_status, events.NewMessage(pattern=r"^/status"))
 
     # Подчищаем недокачанные файлы, оставшиеся от прошлого (упавшего) запуска.
     for name in os.listdir(MEDIA_TMP):
@@ -478,8 +658,9 @@ async def main() -> None:
         )
     log.info("Слушаю события. Ctrl+C для остановки.")
 
-    # Если любой из клиентов отвалится — выходим с ненулевым кодом, чтобы
-    # systemd перезапустил полностью рабочую пару, а не «половину».
+    # Если любой из клиентов отвалится или сторожевой таймер увидит зависание —
+    # выходим с ненулевым кодом, чтобы systemd перезапустил бота целиком.
+    coros.append(watchdog_loop())
     tasks = [asyncio.ensure_future(c) for c in coros]
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for t in pending:
