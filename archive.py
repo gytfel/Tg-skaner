@@ -4,7 +4,9 @@
 дописываются строкой JSON в export/archive.jsonl. Когда суммарный объём
 (archive.jsonl + *.part + папка media/) достигает лимита, всё упаковывается в zip:
 
-    переписки/<чат> (<id>).txt  — читаемые переписки, по файлу на чат;
+    index.html                  — оглавление: все чаты с типом, id, счётчиками;
+    чаты/*.html                 — переписки «как в Telegram» (см. render.py);
+    переписки/*.txt             — те же переписки простым текстом;
     raw/archive.*.jsonl         — исходные записи (для программ);
     media/                      — вложения.
 
@@ -21,84 +23,38 @@ import glob
 import json
 import logging
 import os
-import re
 import shutil
 import threading
 import zipfile
 from datetime import datetime
 
+from render import Clock, render_export
+
 log = logging.getLogger("tg-skaner")
 
 # Запас под лимит Telegram на размер одного файла (~2 ГБ).
 MAX_LIMIT_MB = 1900
-# Сколько файлов переписок держать открытыми одновременно при сборке.
-_MAX_OPEN = 64
-_BAD_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 
 
-# ─────────────────────────── форматирование ────────────────────────────────
+def make_clock(tz_name: str | None) -> Clock:
+    """Часовой пояс для времени в переписках (TIMEZONE), иначе — время сервера."""
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
 
-def _fmt_ts(ts) -> str:
-    if not ts:
-        return "?"
-    try:
-        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
-    except (OverflowError, OSError, TypeError, ValueError):
-        return "?"
-
-
-def _safe_name(name: str) -> str:
-    return _BAD_CHARS.sub("_", name).strip(" .")[:60] or "chat"
-
-
-def _indent(text: str) -> str:
-    return text.replace("\n", "\n    ")
-
-
-def _who(r: dict) -> str:
-    if r.get("outgoing"):
-        return "Вы"
-    name = r.get("sender") or "?"
-    if r.get("username"):
-        name += f" (@{r['username']})"
-    return name
-
-
-def _media_note(r: dict) -> str:
-    media = r.get("media")
-    if not media:
-        skipped = r.get("media_skipped")
-        return f" [медиа не сохранено: {skipped}]" if skipped else ""
-    base = os.path.basename(media)
-    if r.get("media_here", True):
-        return f" [медиа: media/{base}]"
-    return f" [медиа: {base} — в одном из прошлых архивов]"
-
-
-def format_record(r: dict) -> str:
-    """Одна запись архива -> строка читаемой переписки."""
-    kind = r.get("type", "msg")
-    ts = _fmt_ts(r.get("ts"))
-    who = _who(r)
-    num = f" #{r['msg_id']}" if r.get("msg_id") is not None else ""
-    if kind == "edit":
-        return (
-            f"[{ts}] ✏️ {who} изменил(а) сообщение{num}\n"
-            f"    было:  {_indent(r.get('old') or '(пусто)')}\n"
-            f"    стало: {_indent(r.get('new') or '(пусто)')}"
-        )
-    body = (_indent(r.get("text") or "") + _media_note(r)).strip()
-    if kind == "del":
-        return (
-            f"[{ts}] 🗑 УДАЛЕНО сообщение{num} от {who} "
-            f"(отправлено {_fmt_ts(r.get('orig_ts'))}): {body or '(без текста)'}"
-        )
-    return f"[{ts}] {who}: {body or '(пусто)'}"
+            return Clock(ZoneInfo(tz_name), tz_name)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("TIMEZONE=%s не распознан (%s) — использую время сервера.", tz_name, exc)
+    local = datetime.now().astimezone().tzname() or "?"
+    return Clock(None, f"время сервера, {local}")
 
 
 class Archiver:
-    def __init__(self, export_dir: str, media_dir: str, limit_mb: int) -> None:
+    def __init__(
+        self, export_dir: str, media_dir: str, limit_mb: int, tz_name: str | None = None
+    ) -> None:
         self.export_dir = export_dir
+        self.clock = make_clock(tz_name)
         self.media_dir = media_dir
         effective = min(max(1, limit_mb), MAX_LIMIT_MB)
         if effective != limit_mb:
@@ -203,50 +159,6 @@ class Archiver:
                 pass
         return count, freed
 
-    def render_chats(self, part_files: list[str], out_dir: str) -> dict:
-        """Раскладывает записи по файлам-перепискам (по чату), потоково —
-        без загрузки всего архива в память. Возвращает счётчики записей."""
-        stats = {"msg": 0, "edit": 0, "del": 0}
-        names: dict[str, str] = {}
-        handles: dict = {}
-        try:
-            for p in part_files:
-                try:
-                    f = open(p, encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                with f:
-                    for line in f:
-                        try:
-                            r = json.loads(line)
-                        except ValueError:
-                            continue
-                        if not isinstance(r, dict):
-                            continue
-                        key = str(r.get("chat_id"))
-                        fh = handles.get(key)
-                        if fh is None:
-                            if len(handles) >= _MAX_OPEN:
-                                for h in handles.values():
-                                    h.close()
-                                handles.clear()
-                            if key not in names:
-                                names[key] = f"{_safe_name(r.get('chat') or 'chat')} ({key}).txt"
-                            path = os.path.join(out_dir, names[key])
-                            is_new = not os.path.exists(path)
-                            fh = open(path, "a", encoding="utf-8")
-                            if is_new:
-                                fh.write(f"══ Переписка: {r.get('chat') or '—'} (id {key}) ══\n\n")
-                            handles[key] = fh
-                        fh.write(format_record(r) + "\n")
-                        kind = r.get("type", "msg")
-                        if kind in stats:
-                            stats[kind] += 1
-        finally:
-            for h in handles.values():
-                h.close()
-        return stats
-
     def build_zip(self, media_budget: int | None = None):
         """Готовит zip к отправке (блокирующая операция — вызывать в to_thread).
 
@@ -281,12 +193,15 @@ class Archiver:
         written_media: list[str] = []
         try:
             os.makedirs(render_dir, exist_ok=True)
-            stats = self.render_chats(part_files, render_dir)
+            media_names = {os.path.basename(m) for m in media_files}
+            stats = render_export(part_files, render_dir, media_names, self.clock)
             with zipfile.ZipFile(
                 tmp_path, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False
             ) as zf:
-                for name in sorted(os.listdir(render_dir)):
-                    zf.write(os.path.join(render_dir, name), arcname=f"переписки/{name}")
+                for root, _dirs, files in os.walk(render_dir):
+                    for name in sorted(files):
+                        fp = os.path.join(root, name)
+                        zf.write(fp, arcname=os.path.relpath(fp, render_dir))
                 for p in part_files:
                     try:
                         raw = os.path.basename(p)[: -len(".part")] + ".jsonl"

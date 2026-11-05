@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_name     TEXT,
     sender_username TEXT,
     chat_title      TEXT,
+    chat_type       TEXT,
+    chat_username   TEXT,
+    media_kind      TEXT,
     text            TEXT,
     media_path      TEXT,
     outgoing        INTEGER DEFAULT 0,
@@ -38,7 +41,15 @@ class MessageStore:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Добавляет новые колонки в базу, созданную старой версией."""
+        have = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages)")}
+        for col in ("chat_type", "chat_username", "media_kind"):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
 
     def add(self, **fields: Any) -> None:
         fields.setdefault("cached_at", int(time.time()))

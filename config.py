@@ -49,6 +49,7 @@ class Config:
     max_media_mb: int
     archive_channels: bool
     min_free_mb: int
+    timezone: str | None
 
 
 def load_config() -> Config:
@@ -101,6 +102,7 @@ def load_config() -> Config:
         max_media_mb=max(0, max_media_mb),
         archive_channels=_as_bool(os.getenv("ARCHIVE_CHANNELS"), False),
         min_free_mb=max(0, min_free_mb),
+        timezone=(os.getenv("TIMEZONE", "").strip() or None),
     )
 
 

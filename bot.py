@@ -34,6 +34,7 @@ import time
 from datetime import datetime
 
 from telethon import TelegramClient, events
+from telethon.tl.types import Channel, Chat, MessageMediaWebPage, User
 from telethon.utils import get_display_name
 
 from archive import Archiver
@@ -75,7 +76,7 @@ EXPORT_DIR = "export"
 # Единый архив всех копий + автоэкспорт по лимиту. В тихом режиме экспорт —
 # единственный канал доставки, поэтому он включён всегда.
 archiver = (
-    Archiver(EXPORT_DIR, MEDIA_DIR, cfg.export_limit_mb)
+    Archiver(EXPORT_DIR, MEDIA_DIR, cfg.export_limit_mb, cfg.timezone)
     if cfg.export_enabled or PASSIVE
     else None
 )
@@ -170,7 +171,64 @@ def _row_fields(row) -> dict:
         "sender": row["sender_name"],
         "username": row["sender_username"],
         "outgoing": bool(row["outgoing"]),
+        "chat_type": row["chat_type"],
+        "chat_username": row["chat_username"],
     }
+
+
+def _chat_type(chat) -> str | None:
+    """Тип чата для оформления экспорта (см. render.CHAT_TYPES)."""
+    if isinstance(chat, User):
+        if chat.is_self:
+            return "saved"
+        return "bot" if chat.bot else "private"
+    if isinstance(chat, Chat):
+        return "group"
+    if isinstance(chat, Channel):
+        return "channel" if chat.broadcast else "supergroup"
+    return None
+
+
+# Порядок важен: кружок и GIF — тоже «видео», голосовое — тоже «аудио».
+_MEDIA_KINDS = (
+    ("video_note", "кружок"),
+    ("voice", "голосовое"),
+    ("sticker", "стикер"),
+    ("gif", "GIF"),
+    ("video", "видео"),
+    ("audio", "аудио"),
+    ("photo", "фото"),
+    ("poll", "опрос"),
+    ("geo", "геопозиция"),
+    ("contact", "контакт"),
+    ("document", "файл"),
+)
+
+
+def _media_kind(msg) -> str | None:
+    if not msg.media or isinstance(msg.media, MessageMediaWebPage):
+        return None
+    for attr, label in _MEDIA_KINDS:
+        try:
+            if getattr(msg, attr, None):
+                return label
+        except Exception:  # noqa: BLE001
+            pass
+    return "медиа"
+
+
+def _fwd_name(msg) -> str | None:
+    """От кого переслано сообщение (если переслано)."""
+    if not getattr(msg, "fwd_from", None):
+        return None
+    try:
+        fwd = msg.forward
+        ent = (fwd.sender or fwd.chat) if fwd else None
+        if ent:
+            return get_display_name(ent)
+    except Exception:  # noqa: BLE001
+        pass
+    return msg.fwd_from.from_name or "скрытый отправитель"
 
 
 def _free_bytes() -> int:
@@ -235,6 +293,10 @@ async def cache_new(event: events.NewMessage.Event) -> None:
     if not cfg.archive_channels and getattr(chat, "broadcast", False):
         return
 
+    ctype = _chat_type(chat)
+    chat_username = getattr(chat, "username", None)
+    media_kind = _media_kind(msg)
+
     # Сначала фиксируем текст и метаданные — они не должны зависеть от того,
     # успеет ли докачаться медиа до возможного удаления.
     store.add(
@@ -245,6 +307,9 @@ async def cache_new(event: events.NewMessage.Event) -> None:
         sender_name=get_display_name(sender) if sender else None,
         sender_username=getattr(sender, "username", None),
         chat_title=get_display_name(chat) if chat else None,
+        chat_type=ctype,
+        chat_username=chat_username,
+        media_kind=media_kind,
         text=msg.message or "",
         media_path=None,
         outgoing=1 if msg.out else 0,
@@ -256,7 +321,8 @@ async def cache_new(event: events.NewMessage.Event) -> None:
     # никогда не увидел и не удалил недокачанный файл.
     media_path: str | None = None
     media_skipped: str | None = None
-    if cfg.save_media and msg.media:
+    # Превью ссылок (картинка сайта) не качаем: это не вложение, а лишний трафик.
+    if cfg.save_media and media_kind:
         media_skipped = _media_skip_reason(msg)
         if media_skipped:
             _log_skip(media_skipped)
@@ -281,13 +347,20 @@ async def cache_new(event: events.NewMessage.Event) -> None:
             "ts": int(msg.date.timestamp()) if msg.date else int(time.time()),
             "chat_id": event.chat_id,
             "chat": get_display_name(chat) if chat else None,
+            "chat_type": ctype,
+            "chat_username": chat_username,
             "msg_id": msg.id,
             "sender_id": getattr(sender, "id", None),
             "sender": get_display_name(sender) if sender else None,
             "username": getattr(sender, "username", None),
+            "phone": getattr(sender, "phone", None),
             "outgoing": bool(msg.out),
             "text": msg.message or "",
+            "reply_to": getattr(msg, "reply_to_msg_id", None),
+            "fwd": _fwd_name(msg),
             "media": media_path,
+            "media_kind": media_kind,
+            "file_name": getattr(msg.file, "name", None) if media_kind else None,
             "media_skipped": media_skipped,
         }
     )
@@ -360,6 +433,7 @@ async def on_deleted(event: events.MessageDeleted.Event) -> None:
                 "orig_ts": row["date"],
                 "text": row["text"] or "",
                 "media": media,
+                "media_kind": row["media_kind"],
                 "media_here": media_here,
             }
         )
@@ -447,7 +521,9 @@ def _export_caption(stats: dict, size_mb: float) -> str:
         f"📦 Архив переписок Tg-skaner (~{size_mb:.1f} МБ)\n"
         f"Сообщений: {stats.get('msg', 0)} · удалено: {stats.get('del', 0)} · "
         f"изменено: {stats.get('edit', 0)} · медиа: {stats.get('media', 0)}\n"
-        "Переписки — в папке «переписки». После доставки данные на сервере удалены."
+        "Распакуйте и откройте index.html в браузере — там все чаты с типом, id "
+        "и участниками; удалённое выделено красным, изменённое — жёлтым. "
+        "Текстовые версии — в папке «переписки». Данные на сервере удалены."
     )
 
 
