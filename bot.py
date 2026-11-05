@@ -92,6 +92,10 @@ bot = (
 # Куда и чем слать отчёты — заполняется в main() до регистрации хендлеров.
 _notify_client: TelegramClient | None = None
 _notify_to = None
+# Чаты, которые НЕ архивируем: чат с нашим ботом (или LOG_CHAT). Иначе каждый
+# присланный zip скачивался бы обратно в media/ и вкладывался в следующий
+# архив — архив рос бы сам из себя, а диск забивался.
+_own_chats: set[int] = set()
 
 # Время последнего события (для сторожевого таймера и /status).
 _last_event = time.monotonic()
@@ -213,6 +217,8 @@ def _remove_partial(prefix: str) -> None:
 async def cache_new(event: events.NewMessage.Event) -> None:
     """Сохраняем каждое проходящее сообщение в кэш."""
     global _last_event
+    if event.chat_id in _own_chats:
+        return
     _last_event = time.monotonic()
     msg = event.message
     if cfg.ignore_outgoing and msg.out:
@@ -290,6 +296,8 @@ async def cache_new(event: events.NewMessage.Event) -> None:
 async def on_edited(event: events.MessageEdited.Event) -> None:
     """Фиксируем правки: «было / стало» — в архив (и сообщением, если не тихий режим)."""
     global _last_event
+    if event.chat_id in _own_chats:
+        return
     _last_event = time.monotonic()
     msg = event.message
     if cfg.ignore_outgoing and msg.out:
@@ -325,6 +333,8 @@ async def on_edited(event: events.MessageEdited.Event) -> None:
 async def on_deleted(event: events.MessageDeleted.Event) -> None:
     """Главное: сообщение удалили — достаём оригинал из кэша и фиксируем."""
     global _last_event
+    if event.chat_id is not None and event.chat_id in _own_chats:
+        return
     _last_event = time.monotonic()
     for mid in event.deleted_ids:
         if event.chat_id is not None:
@@ -334,6 +344,8 @@ async def on_deleted(event: events.MessageDeleted.Event) -> None:
 
         if row is None:
             continue  # сообщение не попало в кэш (пришло до запуска бота)
+        if row["chat_id"] in _own_chats:
+            continue
         if cfg.ignore_outgoing and row["outgoing"]:
             continue
 
@@ -597,6 +609,7 @@ async def main() -> None:
     if bot is not None:
         await bot.start(bot_token=cfg.bot_token)
         bot_me = await bot.get_me()
+        _own_chats.add(bot_me.id)  # чат «вы ↔ бот» не архивируем
         _notify_client = bot
         _notify_to = cfg.owner_id or me.id
         coros.append(bot.run_until_disconnected())
@@ -624,6 +637,10 @@ async def main() -> None:
     else:
         _notify_client = user
         _notify_to = resolve_log_chat(cfg.log_chat)
+        try:
+            _own_chats.add(await user.get_peer_id(_notify_to))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось определить LOG_CHAT %s: %s", cfg.log_chat, exc)
         log.info("Доставка в LOG_CHAT: %s", cfg.log_chat)
         if not PASSIVE:
             await _send(STARTUP_TEXT)
@@ -645,6 +662,18 @@ async def main() -> None:
                 os.remove(fp)
         except OSError:
             pass
+    # Копии из чата с ботом, скачанные старой версией (в т.ч. наши же zip):
+    # файлы медиа называются «<chat_id>_<msg_id>.<ext>».
+    removed = 0
+    for cid in _own_chats:
+        for fp in glob.glob(os.path.join(MEDIA_DIR, glob.escape(f"{cid}_") + "*")):
+            try:
+                os.remove(fp)
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        log.info("Удалено %s файлов из чата с ботом (копии прошлых архивов).", removed)
     if archiver is not None:
         archiver.clean_stale()
 
