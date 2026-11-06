@@ -6,9 +6,9 @@ BOT_TOKEN не задан — в LOG_CHAT (по умолчанию «Избра�
 
 Режимы:
   PASSIVE_MODE=true  (тихий, по умолчанию) — никаких сообщений: удаления и
-      правки только записываются в архив, а бот присылает лишь zip-файл
-      переписок, когда архив достигает EXPORT_LIMIT_MB. После доставки файла
-      данные на сервере удаляются.
+      правки только записываются в архив, а бот присылает лишь файл
+      переписки (HTML, открывается прямо в Telegram) и zip с вложениями, когда
+      архив достигает EXPORT_LIMIT_MB. После доставки данные на сервере удаляются.
   PASSIVE_MODE=false — дополнительно каждое удаление/правка сразу приходит
       отдельным сообщением.
 
@@ -457,8 +457,9 @@ async def on_start(event: events.NewMessage.Event) -> None:
     if PASSIVE:
         text = (
             "✅ Tg-skaner на связи (тихий режим).\n"
-            "Сообщений не будет — сюда придёт только zip-файл с перепиской, "
-            f"когда архив накопит ~{cfg.export_limit_mb} МБ."
+            "Сообщений не будет — сюда придёт только файл с перепиской "
+            "(открывается прямо в Telegram) и архив вложений, "
+            f"когда накопится ~{cfg.export_limit_mb} МБ."
         )
     else:
         text = (
@@ -516,34 +517,59 @@ async def retention_loop() -> None:
         await asyncio.sleep(3600)
 
 
-def _export_caption(stats: dict, size_mb: float) -> str:
+def _period(stats: dict) -> str:
+    clock = archiver.clock
+    first, last = stats.get("first"), stats.get("last")
+    if not first:
+        return ""
+    return f"{clock.full(first)} — {clock.full(last)}"
+
+
+def _html_caption(stats: dict) -> str:
     return (
-        f"📦 Архив переписок Tg-skaner (~{size_mb:.1f} МБ)\n"
-        f"Сообщений: {stats.get('msg', 0)} · удалено: {stats.get('del', 0)} · "
-        f"изменено: {stats.get('edit', 0)} · медиа: {stats.get('media', 0)}\n"
-        "Распакуйте и откройте index.html в браузере — там все чаты с типом, id "
-        "и участниками; удалённое выделено красным, изменённое — жёлтым. "
-        "Текстовые версии — в папке «переписки». Данные на сервере удалены."
+        f"📄 Переписка · {_period(stats)}\n"
+        f"Чатов: {stats.get('chats', 0)} · сообщений: {stats.get('msg', 0)} · "
+        f"удалено: {stats.get('del', 0)} · изменено: {stats.get('edit', 0)}\n"
+        "Откройте файл — читается прямо в Telegram."
     )
 
 
-async def _deliver_export(pending) -> None:
-    """Отправляет собранный zip и только после успешной доставки чистит диск.
-    Исключение пробрасывается — вызывающий код повторит отправку позже."""
-    global _last_export_ok
-    zip_path, part_files, media_files, stats = pending
-    size_mb = os.path.getsize(zip_path) / MB
+def _zip_caption(export: dict) -> str:
+    n = export["stats"].get("media", 0)
+    if export.get("html_file"):
+        return (
+            f"📦 Вложения к переписке: {n} файл(ов) — фото, видео, голосовые, документы.\n"
+            f"Распакуйте и откройте {export['name']}.html — всё будет на своих местах."
+        )
+    return f"📦 Вложения к предыдущей переписке: {n} файл(ов)."
+
+
+async def _send_with_timeout(path: str, caption: str) -> float:
+    size_mb = os.path.getsize(path) / MB
     # Таймаут, чтобы зависшая выгрузка не держала экспорт (и диск) вечно.
-    timeout = 600 + size_mb * 30
     await asyncio.wait_for(
-        _notify_client.send_file(
-            _notify_to, zip_path, caption=_export_caption(stats, size_mb)
-        ),
-        timeout=timeout,
+        _notify_client.send_file(_notify_to, path, caption=caption, force_document=True),
+        timeout=600 + size_mb * 30,
     )
-    archiver.cleanup_after_send(part_files, media_files, zip_path)
+    return size_mb
+
+
+async def _deliver_export(export: dict) -> None:
+    """Отправляет страницу переписки и (если есть) zip с вложениями; только
+    после доставки обоих чистит диск. Уже отправленный файл помечается, чтобы
+    при повторе после сбоя не прислать его второй раз. Исключение
+    пробрасывается — вызывающий код повторит отправку позже."""
+    global _last_export_ok
+    total = 0.0
+    if export.get("html"):
+        total += await _send_with_timeout(export["html"], _html_caption(export["stats"]))
+        export["html"] = None
+    if export.get("zip"):
+        total += await _send_with_timeout(export["zip"], _zip_caption(export))
+        export["zip"] = None
+    archiver.cleanup_after_send(export)
     _last_export_ok = time.monotonic()
-    log.info("Экспорт отправлен (~%.1f МБ), данные на сервере очищены.", size_mb)
+    log.info("Экспорт отправлен (~%.1f МБ), данные на сервере очищены.", total)
 
 
 def _emergency_free_disk() -> None:
@@ -562,17 +588,17 @@ def _emergency_free_disk() -> None:
 
 async def export_loop() -> None:
     """Следит за объёмом архива; при превышении лимита (или когда на диске
-    мало места) пакует данные в zip, отправляет владельцу и чистит копии.
+    мало места) готовит экспорт, отправляет владельцу и чистит копии.
 
-    Медиа уходит порциями не больше лимита, поэтому сборка zip не требует
+    Медиа уходит порциями (до 1,5 × лимита), поэтому сборка не требует
     много свободного места, а накопившийся объём выгружается несколькими
-    файлами подряд. При сбое отправки держим готовый zip и повторяем его же
+    файлами подряд. При сбое отправки держим готовые файлы и повторяем их же
     с экспоненциальной паузой (а скачивание нового медиа само остановится,
     если места станет мало — см. MIN_FREE_MB).
     """
     if archiver is None:
         return
-    pending = None  # (zip_path, part_files, media_files, stats) — собран, не отправлен
+    pending = None  # собранный, но ещё не доставленный экспорт (см. build_export)
     delay = 60
     backoff = 60
     while True:
@@ -594,10 +620,10 @@ async def export_loop() -> None:
                     max(MB, archiver.free_bytes() - EMERGENCY_FREE),
                 )
                 try:
-                    pending = await asyncio.to_thread(archiver.build_zip, budget)
+                    pending = await asyncio.to_thread(archiver.build_export, budget)
                 except OSError as exc:
                     if exc.errno == errno.ENOSPC:
-                        log.error("Нет места для сборки zip — освобождаю диск.")
+                        log.error("Нет места для сборки экспорта — освобождаю диск.")
                         archiver.drop_oldest_media(archiver.limit_bytes)
                         delay = 5
                         continue
@@ -606,7 +632,7 @@ async def export_loop() -> None:
                     continue
 
             if _notify_client is None or _notify_to is None:
-                backoff = min(backoff * 2, 3600)  # некуда слать — ждём, zip храним
+                backoff = min(backoff * 2, 3600)  # некуда слать — ждём, файлы храним
                 delay = backoff
                 continue
 
@@ -616,7 +642,7 @@ async def export_loop() -> None:
                 backoff = 60
                 delay = 5  # сразу проверяем, не осталось ли ещё порций
             except Exception as exc:  # noqa: BLE001
-                # zip сохраняем и повторим его же позже; данные не теряются.
+                # файлы сохраняем и повторим их же позже; данные не теряются.
                 backoff = min(backoff * 2, 3600)
                 delay = backoff
                 log.error(

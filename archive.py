@@ -2,20 +2,21 @@
 
 Каждое проходящее сообщение, а также события «изменено» и «удалено»
 дописываются строкой JSON в export/archive.jsonl. Когда суммарный объём
-(archive.jsonl + *.part + папка media/) достигает лимита, всё упаковывается в zip:
+(archive.jsonl + *.part + папка media/) достигает лимита, готовится экспорт:
 
-    index.html                  — оглавление: все чаты с типом, id, счётчиками;
-    чаты/*.html                 — переписки «как в Telegram» (см. render.py);
-    переписки/*.txt             — те же переписки простым текстом;
-    raw/archive.*.jsonl         — исходные записи (для программ);
-    media/                      — вложения.
+    perepiska_<дата>.html            — все переписки одной страницей; бот шлёт
+                                       её отдельным файлом, она открывается
+                                       прямо в Telegram (фото встроены);
+    perepiska_<дата>_vlozheniya.zip  — только если есть вложения:
+        perepiska_<дата>.html        — та же страница, видео/голосовые играют;
+        media/                       — вложения;
+        raw/archive.*.jsonl          — исходные записи (для программ).
 
-zip отправляется владельцу, после чего локальные копии удаляются.
+Файлы отправляются владельцу, после чего локальные копии удаляются.
 messages.db (детекция удалений) не трогается.
 
-Медиа выгружается порциями не больше лимита: один zip не превышает
-EXPORT_LIMIT_MB, поэтому для сборки нужно мало свободного места, а
-накопившийся «хвост» уходит несколькими файлами подряд.
+Медиа выгружается порциями (до 1,5 × лимита на zip), поэтому для сборки нужно
+мало свободного места, а накопившийся «хвост» уходит несколькими файлами.
 """
 from __future__ import annotations
 
@@ -68,7 +69,7 @@ class Archiver:
         # отрывались от своих сообщений. Делится только большой накопленный объём.
         self.chunk_bytes = min(self.limit_bytes * 3 // 2, MAX_LIMIT_MB * 1024 * 1024)
         self.archive_path = os.path.join(export_dir, "archive.jsonl")
-        # threading.Lock: append() идёт из event-loop, build_zip() — из рабочего
+        # threading.Lock: append() идёт из event-loop, build_export() — из рабочего
         # потока (to_thread); обычный asyncio.Lock их бы не синхронизировал.
         self._lock = threading.Lock()
         os.makedirs(export_dir, exist_ok=True)
@@ -163,16 +164,17 @@ class Archiver:
                 pass
         return count, freed
 
-    def build_zip(self, media_budget: int | None = None):
-        """Готовит zip к отправке (блокирующая операция — вызывать в to_thread).
+    def build_export(self, media_budget: int | None = None) -> dict | None:
+        """Готовит экспорт к отправке (блокирующая операция — вызывать в to_thread).
 
-        media_budget — сколько байт медиа положить в этот zip (по умолчанию —
-        лимит экспорта). Остальное медиа уйдёт следующими файлами.
+        media_budget — сколько байт медиа взять в этот раз (по умолчанию —
+        порция chunk_bytes). Остальное медиа уйдёт следующими экспортами.
 
-        Возвращает (zip_path, written_parts, written_media, stats) либо None,
-        если экспортировать нечего. Пишем во временный файл и переименовываем —
-        чтобы при ошибке (ENOSPC и т.п.) не оставить битый .zip. Удаляются
-        потом только те файлы, что реально попали в архив.
+        Возвращает словарь {html, zip, name, parts, media, stats} либо None, если
+        экспортировать нечего. html/zip — пути к файлам для отправки (или None).
+        Всё пишется во временные файлы и переименовывается — при ошибке
+        (ENOSPC и т.п.) не остаётся битых файлов. Удаляются потом только те
+        записи и медиа, что реально попали в экспорт.
         """
         with self._lock:
             if os.path.exists(self.archive_path) and os.path.getsize(self.archive_path) > 0:
@@ -189,65 +191,86 @@ class Archiver:
         if not part_files and not media_files:
             return None
 
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        zip_path = os.path.join(self.export_dir, f"tg-skaner-export-{ts}.zip")
-        tmp_path = zip_path + ".tmp"
-        render_dir = os.path.join(self.export_dir, f".render-{ts}")
-        written_parts: list[str] = []
+        name = "perepiska_" + datetime.now(self.clock.tz).strftime("%Y%m%d_%H%M%S")
+        html_path = os.path.join(self.export_dir, f"{name}.html")
+        zip_path = os.path.join(self.export_dir, f"{name}_vlozheniya.zip")
+        work_dir = os.path.join(self.export_dir, f".render-{name}")
+        page_in_zip = os.path.join(work_dir, f"{name}.html")
+        media_paths = {os.path.basename(m): m for m in media_files}
         written_media: list[str] = []
+        tmp_files = [html_path + ".tmp", zip_path + ".tmp"]
         try:
-            os.makedirs(render_dir, exist_ok=True)
-            media_names = {os.path.basename(m) for m in media_files}
-            stats = render_export(part_files, render_dir, media_names, self.clock)
-            with zipfile.ZipFile(
-                tmp_path, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False
-            ) as zf:
-                for root, _dirs, files in os.walk(render_dir):
-                    for name in sorted(files):
-                        fp = os.path.join(root, name)
-                        zf.write(fp, arcname=os.path.relpath(fp, render_dir))
-                for p in part_files:
-                    try:
-                        raw = os.path.basename(p)[: -len(".part")] + ".jsonl"
-                        zf.write(p, arcname=f"raw/{raw}")
-                        written_parts.append(p)
-                    except OSError:
-                        pass
-                for m in media_files:
-                    try:
-                        # медиа уже сжато — не тратим CPU на DEFLATE.
-                        zf.write(
-                            m,
-                            arcname=f"media/{os.path.basename(m)}",
-                            compress_type=zipfile.ZIP_STORED,
-                        )
-                        written_media.append(m)
-                    except OSError:
-                        pass  # файл исчез во время упаковки — просто пропускаем
-            os.replace(tmp_path, zip_path)
+            os.makedirs(work_dir, exist_ok=True)
+            stats = render_export(
+                part_files,
+                work_dir,
+                self.clock,
+                media_paths,
+                phone_path=tmp_files[0] if part_files else None,
+                archive_path=page_in_zip if (part_files and media_files) else None,
+            )
+            has_page = os.path.exists(tmp_files[0])
+            if media_files:
+                with zipfile.ZipFile(
+                    tmp_files[1], "w", zipfile.ZIP_DEFLATED, strict_timestamps=False
+                ) as zf:
+                    if os.path.exists(page_in_zip):
+                        zf.write(page_in_zip, arcname=f"{name}.html")
+                    for m in media_files:
+                        try:
+                            # медиа уже сжато — не тратим CPU на DEFLATE.
+                            zf.write(
+                                m,
+                                arcname=f"media/{os.path.basename(m)}",
+                                compress_type=zipfile.ZIP_STORED,
+                            )
+                            written_media.append(m)
+                        except OSError:
+                            pass  # файл исчез во время упаковки — пропускаем
+                    for p in part_files:
+                        try:
+                            raw = os.path.basename(p)[: -len(".part")] + ".jsonl"
+                            zf.write(p, arcname=f"raw/{raw}")
+                        except OSError:
+                            pass
+                os.replace(tmp_files[1], zip_path)
+            if has_page:
+                os.replace(tmp_files[0], html_path)
         except BaseException:
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
+            for t in tmp_files:
+                try:
+                    if os.path.exists(t):
+                        os.remove(t)
+                except OSError:
+                    pass
             raise
         finally:
-            shutil.rmtree(render_dir, ignore_errors=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
         stats["media"] = len(written_media)
-        return zip_path, written_parts, written_media, stats
+        return {
+            "name": name,
+            # html/zip — что ещё нужно отправить (бот обнуляет после отправки),
+            # html_file/zip_file — что удалить с диска после доставки.
+            "html": html_path if has_page else None,
+            "zip": zip_path if media_files else None,
+            "html_file": html_path if has_page else None,
+            "zip_file": zip_path if media_files else None,
+            # записи целиком вошли в страницу — после отправки их можно удалить
+            "parts": list(part_files),
+            "media": written_media,
+            "stats": stats,
+        }
 
-    def cleanup_after_send(
-        self, part_files: list[str], media_files: list[str], zip_path: str
-    ) -> None:
+    def cleanup_after_send(self, export: dict) -> None:
         """Удаляет локальные копии ПОСЛЕ успешной отправки (освобождает диск).
 
-        Удаляются только файлы, реально попавшие в zip; записи/медиа, добавленные
-        во время экспорта (и не вошедшие в архив), остаются.
+        Удаляются только записи и медиа, реально попавшие в экспорт; то, что
+        добавилось во время отправки, остаётся до следующего раза.
         """
-        for p in [*part_files, *media_files, zip_path]:
+        files = [*export["parts"], *export["media"], export["html_file"], export["zip_file"]]
+        for p in files:
             try:
-                if os.path.exists(p):
+                if p and os.path.exists(p):
                     os.remove(p)
             except OSError:
                 pass
@@ -256,7 +279,10 @@ class Archiver:
         """Убирает хвосты прошлого (упавшего) запуска: неотправленные/недособранные
         zip и временные папки. Данные не теряются — они остались в *.part и
         media/ и попадут в следующий экспорт."""
-        for pattern in ("tg-skaner-export-*.zip", "tg-skaner-export-*.zip.tmp"):
+        for pattern in (
+            "perepiska_*.html", "perepiska_*.zip", "perepiska_*.tmp",
+            "tg-skaner-export-*.zip", "tg-skaner-export-*.zip.tmp",
+        ):
             for p in glob.glob(os.path.join(self.export_dir, pattern)):
                 try:
                     os.remove(p)
